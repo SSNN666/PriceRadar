@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>真价雷达 · 到手价决策助手</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2430; --sub:#66707e; --accent:#0a6cff; --good:#0a8f4d; --warn:#c47f00; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:28px 16px 60px; }
+  h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--sub); font-size:13px; margin-bottom:20px; }
+  .searchbar { display:flex; gap:8px; }
+  input[type=text] { flex:1; padding:12px 14px; border:1px solid #d8dde5; border-radius:10px; font-size:15px; outline:none; }
+  input[type=text]:focus { border-color:var(--accent); }
+  button { padding:12px 22px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-size:15px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:#fff; color:var(--accent); border:1px solid var(--accent); padding:8px 14px; font-size:13px; border-radius:8px; }
+  button.ghost:disabled { opacity:.5; }
+  .toolbar { margin-top:10px; display:flex; gap:12px; align-items:flex-start; }
+  .snap-status { color:var(--sub); font-size:12px; white-space:pre-wrap; }
+  .opts { margin:10px 2px 0; color:var(--sub); font-size:13px; display:flex; gap:18px; align-items:center; }
+  .opts input[type=number] { width:58px; padding:3px 6px; border:1px solid #d8dde5; border-radius:6px; }
+  .card { background:var(--card); border:1px solid #e6e9ef; border-radius:14px; padding:16px 18px; margin-top:16px; }
+  .tag { color:var(--accent); font-weight:600; }
+  .group { display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; padding:7px 0; border-bottom:1px dashed #eef1f5; }
+  .group:last-of-type { border-bottom:0; }
+  .pill { background:#eef4ff; color:var(--accent); border-radius:999px; padding:1px 10px; font-size:12px; white-space:nowrap; }
+  .pill.warn { background:#fff4e0; color:var(--warn); }
+  .price { font-weight:700; }
+  .offer { display:flex; justify-content:space-between; gap:12px; padding:12px 0; border-bottom:1px solid #eef1f5; }
+  .offer:last-of-type { border-bottom:0; }
+  .offer .t { font-size:14px; } .offer .meta { color:var(--sub); font-size:12px; margin-top:2px; }
+  .formula { color:var(--sub); font-size:12px; margin-top:4px; word-break:break-all; }
+  .rejected { color:var(--warn); font-size:12px; margin-top:2px; }
+  .foot { color:var(--sub); font-size:12px; margin-top:12px; }
+  .trace { color:#97a1af; font-size:11px; margin-top:8px; }
+  .error { color:#c02b2b; margin-top:14px; }
+  .loading { color:var(--sub); margin-top:14px; }
+  .hidden { display:none; }
+  .thumb { width:46px; height:46px; border-radius:8px; object-fit:cover; background:#eef1f5; flex:0 0 auto; }
+  .group .thumb { width:32px; height:32px; border-radius:6px; }
+  .offer .t a, .group a { color:inherit; text-decoration:none; border-bottom:1px dotted #b8c0cc; }
+  .offer .t a:hover, .group a:hover { color:var(--accent); }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+  .chips .label { color:var(--sub); font-size:12px; margin-right:2px; }
+  .chip { background:#fff; color:var(--sub); border:1px solid #d8dde5; border-radius:999px; padding:4px 12px; font-size:12px; cursor:pointer; }
+  .chip.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .trust { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
+  .trust span { background:#eef7f1; color:var(--good); border-radius:4px; padding:1px 7px; font-size:11px; }
+  .quality { font-size:12px; margin-top:4px; padding:4px 8px; border-radius:6px; background:#f4f6f9; color:var(--sub); }
+  .quality strong { font-weight:600; }
+  .quality.t-strong { background:#eef7f1; color:var(--good); }
+  .quality.t-fair { background:#f4f6f9; color:var(--ink); }
+  .quality.t-caution, .quality.t-thin_sample { background:#fff4e0; color:var(--warn); }
+  button.mini { padding:3px 9px; font-size:11px; border-radius:6px; background:#fff; color:var(--accent); border:1px solid var(--accent); cursor:pointer; }
+  button.mini:hover { background:var(--accent); color:#fff; }
+  .decision { border-left:4px solid var(--sub); }
+  .decision.d-recommend { border-left-color:var(--good); background:#f7fdf9; }
+  .decision.d-tradeoff { border-left-color:var(--accent); }
+  .decision.d-watch { border-left-color:var(--warn); background:#fffcf5; }
+  .decision.d-discourage { border-left-color:#c02b2b; background:#fff7f7; }
+  .decision.d-fallback { border-left-color:#c8cfd9; }
+  .dtier { display:inline-block; font-size:12px; font-weight:600; padding:2px 10px; border-radius:999px; background:#eef1f5; color:var(--sub); margin-bottom:6px; }
+  .decision.d-recommend .dtier { background:#e6f6ec; color:var(--good); }
+  .decision.d-watch .dtier { background:#fff4e0; color:var(--warn); }
+  .decision.d-discourage .dtier { background:#fdecec; color:#c02b2b; }
+  .dhead { font-size:15px; font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>真价雷达 <span style="font-size:13px;color:var(--sub)">· 到手价决策助手</span></h1>
+  <div class="sub">输入关键词或一句话 —— 跨平台公开优惠口径到手价 + 同款匹配（数据来自拼多多与京东联盟官方 API）</div>
+  <div class="searchbar">
+    <input id="q" type="text" placeholder="例如：帮我看看 QCY N20 降噪耳机哪里买划算" value="帮我看看QCY N20降噪耳机哪个平台买划算">
+    <button id="go">查询</button>
+  </div>
+  <div class="opts">
+    <label><input id="useLlm" type="checkbox" checked> LLM 理解与总结</label>
+    <label title="0=自动按品类选频道；-1=关闭京东侧">京东频道 <input id="jdCh" type="number" value="0" style="width:44px"></label>
+    <label><input id="useRisk" type="checkbox"> 风险扫描（约 ¥0.2/次）</label>
+  </div>
+  <div class="toolbar">
+    <button id="snap" class="ghost" title="按关注清单（data/watchlist.json）采集当日到手价；同日重复自动幂等跳过">采集今日快照</button>
+    <button id="vision" class="ghost" title="上传商品图，识别后一键比价（需配置 DASHSCOPE_API_KEY）">识图比价</button>
+    <button id="coupon" class="ghost" title="上传券截图：识别 → 确认 → 自动并入到手价重算">券截图补录</button>
+    <input id="imgInput" type="file" accept="image/*" hidden>
+    <input id="couponInput" type="file" accept="image/*" hidden>
+    <span id="snapStatus" class="snap-status"></span>
+  </div>
+  <div id="drops"></div>
+  <div id="watchlist"></div>
+  <div id="vision-out"></div>
+  <div id="status" class="loading hidden">查询中（约 3-10 秒）…</div>
+  <div id="error" class="error hidden"></div>
+  <div id="out" class="hidden"></div>
+  <div id="similar-out"></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+
+// 服务端异常时曾返回纯文本 "Internal Server Error"，直接 .json() 会炸成
+// "Unexpected token 'I'"——把真实原因盖掉。统一走这里，读不到 JSON 也要说人话。
+async function readJson(resp) {
+  const text = await resp.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`服务返回了非 JSON 响应（HTTP ${resp.status}）：${text.slice(0, 160)}`);
+  }
+}
+$("go").onclick = search;
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+$("snap").onclick = snapshot;
+$("vision").onclick = () => $("imgInput").click();
+$("coupon").onclick = () => $("couponInput").click();
+
+async function uploadImage(file, mode) {
+  const form = new FormData();
+  form.append("file", file);
+  const resp = await fetch(`/api/vision?mode=${mode}`, { method: "POST", body: form });
+  const data = await readJson(resp);
+  if (!resp.ok) throw new Error(data.detail || "识图失败");
+  return data;
+}
+
+$("imgInput").onchange = async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  $("snapStatus").textContent = "识图中（约 3-10 秒）…";
+  try {
+    renderVision(await uploadImage(file, "product"));
+    $("snapStatus").textContent = "";
+  } catch (err) {
+    $("snapStatus").textContent = "识图出错了：" + err.message;
+  }
+  event.target.value = "";
+};
+
+let pendingCoupons = null;
+$("couponInput").onchange = async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  $("snapStatus").textContent = "识别券信息中（约 3-10 秒）…";
+  try {
+    renderCouponConfirm(await uploadImage(file, "coupon"));
+    $("snapStatus").textContent = "";
+  } catch (err) {
+    $("snapStatus").textContent = "券识别出错了：" + err.message;
+  }
+  event.target.value = "";
+};
+
+function renderCouponConfirm(d) {
+  pendingCoupons = d;
+  if (!d.coupons || !d.coupons.length) {
+    $("vision-out").innerHTML = `<div class="card">△ 没有识别到清晰的券信息，换张图试试</div>`;
+    return;
+  }
+  const rows = d.coupons.map((c) => `<div class="group">
+      <span class="pill">${esc(c.type)}</span>
+      <span class="price">满${esc(c.threshold)}减${esc(c.face_value)}</span>
+      <span>${esc(c.scope || "")}</span>
+      <span style="color:var(--sub);font-size:12px">${c.valid_until ? "至 " + esc(c.valid_until) : ""}｜置信 ${Number(c.confidence).toFixed(2)}</span>
+    </div>`).join("");
+  $("vision-out").innerHTML = `<div class="card"><b>券识别结果</b>（${esc(d.platform)}）——<span style="color:var(--warn)">确认后才会计入到手价</span>
+    ${rows}
+    <div style="margin-top:10px"><button class="ghost" id="confirmCoupons">确认写入</button>
+    <button class="ghost" id="discardCoupons">放弃</button></div></div>`;
+  $("confirmCoupons").onclick = async () => {
+    const resp = await fetch("/api/coupons", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pendingCoupons),
+    });
+    const data = await readJson(resp);
+    if (!resp.ok) { $("vision-out").innerHTML = `<div class="card">写入失败：${esc(data.detail || "")}</div>`; return; }
+    $("vision-out").innerHTML = `<div class="card">✅ ${esc(data.note)}</div>`;
+    if ($("q").value.trim()) search();  // 自动重算当前查询
+  };
+  $("discardCoupons").onclick = () => { $("vision-out").innerHTML = ""; pendingCoupons = null; };
+}
+
+function renderVision(d) {
+  if (!d.is_product) {
+    $("vision-out").innerHTML = `<div class="card">△ 这看起来不是商品图，换一张试试？</div>`;
+    return;
+  }
+  const uncertain = d.uncertain_fields && d.uncertain_fields.length
+    ? `<div class="rejected">△ 不确定字段：${d.uncertain_fields.map(esc).join("、")}（请核对后再比价）</div>` : "";
+  $("vision-out").innerHTML = `<div class="card"><b>识图结果</b>（confidence ${Number(d.confidence).toFixed(2)}）
+    <div class="group">
+      <span class="pill">${esc(d.category || "品类未知")}</span>
+      <span>${esc(d.brand || "")} ${esc(d.model || "")} ${esc(d.color || "")}</span>
+    </div>
+    ${uncertain}
+    <button class="ghost" id="useVisionQuery">按「${esc(d.query)}」去比价</button></div>`;
+  $("useVisionQuery").onclick = () => { $("q").value = d.query; search(); };
+}
+
+async function snapshot() {
+  $("snap").disabled = true;
+  $("snapStatus").textContent = "采集中（约 5-15 秒）…";
+  try {
+    const resp = await fetch("/api/snapshot", { method: "POST" });
+    const data = await readJson(resp);
+    if (!resp.ok) throw new Error(data.detail || "采集失败");
+    const detail = Object.entries(data.keywords).map(([k, v]) => `「${k}」+${v.inserted}`).join("　");
+    let text = `✅ 本次新增 ${data.inserted} 条（${detail}）`;
+    if (data.errors.length) text += "\n△ " + data.errors.join("\n△ ");
+    $("snapStatus").textContent = text + "\n" + data.report;
+  } catch (err) {
+    $("snapStatus").textContent = "出错了：" + err.message;
+  } finally {
+    $("snap").disabled = false;
+  }
+  loadWatchlistStatus();
+}
+
+async function loadWatchlistStatus() {
+  try {
+    const resp = await fetch("/api/watchlist-status");
+    const data = await readJson(resp);
+    $("snapStatus").textContent = data.captured_today
+      ? `✅ 今日已采集 ${data.rows_today} 条（库内共 ${data.total_rows} 条）`
+      : `⚠️ 今日尚未采集（库内共 ${data.total_rows} 条）`;
+    $("drops").innerHTML = data.drops.length
+      ? `<div class="card"><b>降价提醒</b>（较上次观测）${data.drops.map((d) => `
+          <div class="group">
+            <span class="pill warn">${esc(d.platform)}</span>
+            <span>${esc(d.title).slice(0, 34)}</span>
+            <span class="price">￥${esc(d.previous_price)} → ￥${esc(d.latest_price)}</span>
+            <span class="pill">${d.drop_pct}%${d.new_low ? " · 观测新低" : ""}</span>
+          </div>`).join("")}</div>`
+      : "";
+    $("watchlist").innerHTML = data.watchlist && data.watchlist.length
+      ? `<div class="card"><b>关注面板</b>（自采快照 · 观测天数最多的商品）${data.watchlist.map((w) => `
+          <div class="group">
+            ${w.image_url ? `<img class="thumb" src="${esc(w.image_url)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">` : ""}
+            <span class="pill">${esc(w.platform)}</span>
+            <span>${w.url ? `<a href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.title).slice(0, 32)}</a>` : esc(w.title).slice(0, 32)}</span>
+            <span class="price">￥${esc(w.latest_price)}</span>
+            <span style="color:var(--sub);font-size:12px">已观测 ${w.observed_days} 天 ｜ ${esc(w.verdict)}</span>
+            ${w.series && w.series.length > 1 ? sparkline(w.series) : ""}
+            ${w.fake_discount ? `<span class="pill warn">△ 疑似先涨后降</span>` : ""}
+          </div>`).join("")}
+          <div class="foot">※ 基于自观测数据（非平台全历史）；样本 &lt;14 天不出时机结论</div></div>`
+      : "";
+  } catch (err) { /* 状态加载失败静默 */ }
+}
+loadWatchlistStatus();
+const esc = (s) => { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; };
+
+function sparkline(series) {
+  const prices = series.map((p) => Number(p.price));
+  const min = Math.min(...prices), max = Math.max(...prices);
+  const w = 96, h = 22;
+  const pts = prices.map((v, i) => {
+    const x = prices.length > 1 ? (i / (prices.length - 1)) * w : 0;
+    const y = max === min ? h / 2 : h - ((v - min) / (max - min)) * (h - 4) - 2;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="vertical-align:middle"><polyline points="${pts}" fill="none" stroke="#0a6cff" stroke-width="1.6"/></svg>`;
+}
+
+async function search() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("go").disabled = true;
+  $("status").classList.remove("hidden");
+  $("error").classList.add("hidden");
+  $("out").classList.add("hidden");
+  try {
+    const params = new URLSearchParams({ q, jd_channel: $("jdCh").value || "0", llm: $("useLlm").checked, risk: $("useRisk").checked });
+    const resp = await fetch("/api/search?" + params);
+    const data = await readJson(resp);
+    if (!resp.ok) throw new Error(data.detail || "查询失败");
+    render(data);
+  } catch (err) {
+    $("error").textContent = "出错了：" + err.message;
+    $("error").classList.remove("hidden");
+  } finally {
+    $("go").disabled = false;
+    $("status").classList.add("hidden");
+  }
+}
+
+let lastData = null;
+const filters = { platform: "all", jdPremium: false, minRate: 0, minSales: 0, excludeSuspicious: false };
+
+function chip(label, active, act, val) {
+  return `<button class="chip ${active ? "on" : ""}" data-act="${act}" data-val="${val}">${esc(label)}</button>`;
+}
+
+function filterBarHTML() {
+  return `<div class="card"><b>筛选</b>
+    <div class="chips"><span class="label">平台</span>
+      ${chip("全部", filters.platform === "all", "platform", "all")}
+      ${chip("拼多多", filters.platform === "pdd", "platform", "pdd")}
+      ${chip("京东", filters.platform === "jd", "platform", "jd")}
+    </div>
+    <div class="chips"><span class="label">规则</span>
+      ${chip("仅资质店铺", filters.jdPremium, "jdPremium", "1")}
+      ${chip("好评率 ≥90%", filters.minRate === 90, "minRate", "90")}
+      ${chip("好评率 ≥95%", filters.minRate === 95, "minRate", "95")}
+      ${chip("好评率 ≥98%", filters.minRate === 98, "minRate", "98")}
+      ${chip("销量 ≥1000", filters.minSales === 1000, "minSales", "1000")}
+      ${chip("销量 ≥1万", filters.minSales === 10000, "minSales", "10000")}
+      ${chip("排除疑似先涨后降", filters.excludeSuspicious, "excludeSuspicious", "1")}
+      <button class="chip" data-act="reset" data-val="1">重置</button>
+    </div>
+  </div>`;
+}
+
+function onChip(event) {
+  const act = event.currentTarget.dataset.act;
+  const val = event.currentTarget.dataset.val;
+  if (act === "reset") {
+    filters.platform = "all"; filters.jdPremium = false; filters.minRate = 0; filters.minSales = 0; filters.excludeSuspicious = false;
+  } else if (act === "platform") {
+    filters.platform = val;
+  } else if (act === "jdPremium") {
+    filters.jdPremium = !filters.jdPremium;
+  } else if (act === "minRate") {
+    filters.minRate = filters.minRate === Number(val) ? 0 : Number(val);
+  } else if (act === "minSales") {
+    filters.minSales = filters.minSales === Number(val) ? 0 : Number(val);
+  } else if (act === "excludeSuspicious") {
+    filters.excludeSuspicious = !filters.excludeSuspicious;
+  }
+  syncChips();
+  renderOffers();
+}
+
+function syncChips() {
+  const rules = {
+    platform: filters.platform,
+    jdPremium: filters.jdPremium ? "1" : "0",
+    minRate: String(filters.minRate),
+    minSales: String(filters.minSales),
+    excludeSuspicious: filters.excludeSuspicious ? "1" : "0",
+  };
+  $("out").querySelectorAll(".chip[data-act]").forEach((element) => {
+    if (element.dataset.act === "reset") return;
+    element.classList.toggle("on", rules[element.dataset.act] === element.dataset.val);
+  });
+}
+
+function filteredOffers() {
+  const source = (lastData && lastData.offers) || [];
+  // 资质店铺集合由后端下发（单一事实来源）；拿不到时退回默认，避免筛选静默失效
+  const certified = (lastData && lastData.certified_shop_kinds) || ["self_run", "flagship", "exclusive", "franchise"];
+  const base = source.filter((o) => {
+    if (filters.platform === "pdd" && o.platform !== "拼多多") return false;
+    if (filters.platform === "jd" && o.platform !== "京东") return false;
+    // 无店铺资质数据的商品保留展示（同好评率/销量的"无数据不淘汰"口径）
+    if (filters.jdPremium && o.shop_kind && !certified.includes(o.shop_kind)) return false;
+    return true;
+  });
+  let excludedLowRate = 0;
+  let withRate = 0;
+  let excludedLowSales = 0;
+  let withSales = 0;
+  const list = base.filter((o) => {
+    if (filters.minRate > 0) {
+      const rate = o.signals ? o.signals.good_comments_share : null;
+      if (rate != null) withRate += 1;
+      if (rate != null && Number(rate) < filters.minRate) { excludedLowRate += 1; return false; }
+      // 无好评率数据的商品：无法判断 → 保留展示（提示中说明原因）
+    }
+    if (filters.minSales > 0) {
+      const sales = salesCount(o);
+      if (sales != null) withSales += 1;
+      if (sales != null && sales < filters.minSales) { excludedLowSales += 1; return false; }
+      // 无销量数据的商品：同上，保留展示
+    }
+    if (filters.excludeSuspicious && o.history && o.history.fake_discount) return false;
+    return true;
+  });
+  const hidden = source.length - list.length;
+  const notes = [];
+  const removedByOther = hidden - excludedLowRate - excludedLowSales;
+  if (removedByOther > 0) notes.push(`已按平台/渠道等规则隐藏 ${removedByOther} 条`);
+  if (filters.minRate > 0) {
+    const noData = base.length - withRate;
+    if (withRate === 0) {
+      notes.push(`好评率筛选未生效：当前结果均无好评率数据（该字段由京东提供，拼多多暂缺）`);
+    } else if (excludedLowRate === 0) {
+      notes.push(`好评率筛选：有数据的 ${withRate} 条均 ≥${filters.minRate}%${noData ? `；另有 ${noData} 条无数据保留（无法判断）` : ""}`);
+    } else {
+      notes.push(`好评率筛选：排除 ${excludedLowRate} 条低于 ${filters.minRate}% 的${noData ? `；另有 ${noData} 条无数据保留（无法判断）` : ""}`);
+    }
+  }
+  if (filters.minSales > 0) {
+    const noData = base.length - withSales;
+    if (withSales === 0) {
+      notes.push(`销量筛选未生效：当前结果均无销量数据`);
+    } else if (excludedLowSales === 0) {
+      notes.push(`销量筛选：有数据的 ${withSales} 条均 ≥${fmtSales(filters.minSales)}${noData ? `；另有 ${noData} 条无数据保留（无法判断）` : ""}`);
+    } else {
+      notes.push(`销量筛选：排除 ${excludedLowSales} 条低于 ${fmtSales(filters.minSales)} 的${noData ? `；另有 ${noData} 条无数据保留（无法判断）` : ""}`);
+    }
+    notes.push(`销量口径各平台不同（京东=近 30 天引单量，拼多多=累计销量估算），仅平台内可比`);
+  }
+  return { list, notes };
+}
+
+function fmtCount(n) {
+  const value = Number(n) || 0;
+  return value >= 10000 ? `${(value / 10000).toFixed(1).replace(/\.0$/, "")}万+` : String(value);
+}
+
+// 销量：京东=近 30 天引单量，拼多多=累计销量估算（"1.2万+" 取下界 12000）。
+// 两者口径不同，只做平台内筛选，不做跨平台横向比较。
+const fmtSales = (n) => (n >= 10000 ? `${n / 10000}万` : String(n));
+
+function salesCount(o) {
+  if (!o.signals) return null;
+  if (o.signals.in_order_count_30d != null) return Number(o.signals.in_order_count_30d);
+  if (o.signals.sales_estimate != null) return Number(o.signals.sales_estimate);
+  return null;
+}
+
+function offerRowHTML(o, i) {
+  const meta = [esc(o.platform)];
+  if (o.shop_kind_label) meta.push(o.shop_kind_label);  // 店铺资质（后端给标签，单一事实来源）
+  if (o.shop) meta.push(esc(o.shop));
+  if (o.group_count > 1) meta.push(`同款 ×${o.group_count} 家`);
+  if (o.signals && o.signals.good_comments_share != null) meta.push(`好评率 ${o.signals.good_comments_share}%`);
+  if (o.signals && o.signals.in_order_count_30d != null) meta.push(`月销 ${fmtCount(o.signals.in_order_count_30d)}`);
+  if (o.signals && o.signals.sales_tip) meta.push(`已售 ${esc(o.signals.sales_tip)}`);
+  if (o.signals && o.signals.comments != null) meta.push(`评论 ${fmtCount(o.signals.comments)}`);
+  if (o.signals && o.signals.shop_score_tier) meta.push(`店铺评分 ${esc(o.signals.shop_score_tier)}`);
+  return `
+    <div class="offer">
+      ${o.image_url ? `<img class="thumb" src="${esc(o.image_url)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">` : ""}
+      <div>
+        <div class="t">${i + 1}. ${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.title).slice(0, 48)}</a>` : esc(o.title).slice(0, 48)}</div>
+        <div class="meta">${meta.join(" · ")}</div>
+        ${o.tags && o.tags.length ? `<div class="trust">${o.tags.map((t) => `<span>${esc(t)}</span>`).join("")}</div>` : ""}
+        ${o.quality ? `<div class="quality t-${esc(o.quality.tier)}"><strong>质量${esc(o.quality.label)}</strong>　${esc(o.quality.basis)}${o.quality.missing && o.quality.missing.length ? `　<span style="opacity:.75">（缺：${o.quality.missing.map(esc).join("、")}）</span>` : ""}</div>` : ""}
+        <div class="formula">${esc(o.formula)}</div>
+        ${o.rejected.map((r) => `<div class="rejected">△ 未计入：${esc(r.label)}（${esc(r.reason)}）</div>`).join("")}
+        ${o.history ? `<div class="meta" style="color:var(--good)">价格观测：已观测 ${o.history.observed_days} 天 ｜ ${esc(o.history.verdict)}${o.history.series && o.history.series.length > 1 ? "　" + sparkline(o.history.series) : ""}</div>` : ""}
+        ${o.history && o.history.fake_discount ? `<div class="rejected">△ ${esc(o.history.fake_discount)}</div>` : ""}
+      </div>
+      <div style="text-align:right;white-space:nowrap">
+        <div class="price">￥${esc(o.final_price)}</div>
+        ${o.goods_sign ? `<div style="margin-top:6px"><button class="mini" data-similar="${esc(o.goods_sign)}" data-title="${esc(o.title)}">找相似</button></div>` : ""}
+        ${Number(o.total_discount) > 0 ? `<div class="meta" style="color:var(--good)">已省 ￥${esc(o.total_discount)}</div>` : ""}
+      </div>
+    </div>`;
+}
+
+function renderOffers() {
+  const filtered = filteredOffers();
+  $("offerList").innerHTML = filtered.list.length
+    ? filtered.list.map((o, i) => offerRowHTML(o, i)).join("")
+    : `<div class="rejected">当前筛选条件下没有商品，试试放宽规则</div>`;
+  $("filterHint").textContent = filtered.notes.join("；");
+  $("offerList").querySelectorAll("button[data-similar]").forEach((element) => {
+    element.onclick = () => findSimilar(element.dataset.similar, element.dataset.title);
+  });
+}
+
+// —— 找相似（平台原生 channel_type=3）——
+// 关键词搜"保温杯"返回的是款式各异的商品；以某个商品为锚点，平台给出的是"像这个的"。
+async function findSimilar(sign, title) {
+  $("similar-out").innerHTML = `<div class="card loading">正在找相似商品…</div>`;
+  try {
+    const resp = await fetch(`/api/similar?goods_sign=${encodeURIComponent(sign)}&limit=20`);
+    const data = await readJson(resp);
+    if (!resp.ok) throw new Error(data.detail || "找相似失败");
+    renderSimilar(data, title);
+  } catch (err) {
+    $("similar-out").innerHTML = `<div class="card error">找相似出错：${esc(err.message)}</div>`;
+  }
+}
+
+function renderSimilar(d, anchorTitle) {
+  const list = d.offers.slice().sort((a, b) => Number(a.final_price) - Number(b.final_price));
+  const rows = list.map((o, i) => `
+    <div class="offer">
+      ${o.image_url ? `<img class="thumb" src="${esc(o.image_url)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">` : ""}
+      <div>
+        <div class="t">${i === 0 ? '<span class="pill">最低价</span> ' : ""}${o.url ? `<a href="${esc(o.url)}" target="_blank" rel="noopener">${esc(o.title).slice(0, 46)}</a>` : esc(o.title).slice(0, 46)}</div>
+        <div class="meta">${[esc(o.platform), o.shop_kind_label, esc(o.shop || "")].filter(Boolean).join(" · ")}</div>
+        ${o.quality ? `<div class="quality t-${esc(o.quality.tier)}"><strong>质量${esc(o.quality.label)}</strong>　${esc(o.quality.basis)}</div>` : ""}
+      </div>
+      <div style="text-align:right;white-space:nowrap"><div class="price">￥${esc(o.final_price)}</div></div>
+    </div>`).join("");
+  $("similar-out").innerHTML = `<div class="card"><b>相似商品</b>（锚点：${esc(anchorTitle).slice(0, 30)}｜共 ${d.count} 条 · 按到手价升序）
+    ${rows}
+    ${d.notes.map((n) => `<div class="foot">※ ${esc(n)}</div>`).join("")}
+    <div style="margin-top:10px"><button class="ghost" id="closeSimilar">关闭</button></div></div>`;
+  $("closeSimilar").onclick = () => { $("similar-out").innerHTML = ""; };
+  $("similar-out").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function render(d) {
+  lastData = d;
+  const parts = [];
+  // 决策结论放最前——这是"数据展示"变"决策建议"的落点
+  if (d.decision) {
+    const t = d.decision;
+    parts.push(`<div class="card decision d-${esc(t.tier)}">
+      <div class="dtier">${esc(t.label)}</div>
+      <div class="dhead">${esc(t.headline)}</div>
+      ${t.high_risk_topics && t.high_risk_topics.length
+        ? `<div class="rejected">△ 风险主题：${t.high_risk_topics.map(esc).join("、")}（商品级信号，未指向具体店铺）</div>` : ""}
+      ${t.note ? `<div class="foot">${esc(t.note)}</div>` : ""}
+      <div class="foot">※ 规则产出，非综合评分；判定依据为店铺资质 + 质量信号（见下方每条明细）</div>
+    </div>`);
+  }
+  if (d.summary) {
+    parts.push(`<div class="card"><span class="tag">AI 摘要</span>　${esc(d.summary)}</div>`);
+  }
+  if (d.campaign_context) {
+    parts.push(`<div class="card"><span class="tag">大促日历</span>　${esc(d.campaign_context)}　<span style="color:var(--sub);font-size:12px">（参考往年规律）</span></div>`);
+  }
+  if (d.risk) {
+    const issues = d.risk.issues.map((i) => `<div class="group"><span class="pill warn">${esc(i.topic)}</span><span>${i.mention_count} 条提及</span></div>`).join("");
+    parts.push(`<div class="card"><b>风险扫描</b>（${d.risk.queries.length} 组关键词 · 命中 ${d.risk.item_count} 条讨论）
+      ${issues || `<div class="rejected">△ ${esc(d.risk.note)}</div>`}
+      <div class="foot">※ 部分平台内容未被搜索引擎完整收录，检索结果不代表全部用户反馈</div></div>`);
+  }
+  const groups = d.groups.map((g) => `
+    <div class="group">
+      ${g.image_url ? `<img class="thumb" src="${esc(g.image_url)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">` : ""}
+      <span class="pill">${esc(g.platform)}${g.is_source_group ? " · 源商品组" : ""}</span>
+      ${g.count > 1 ? `<span class="pill warn">同款 ×${g.count} 家</span>` : ""}
+      <span>${g.url ? `<a href="${esc(g.url)}" target="_blank" rel="noopener">${esc(g.title).slice(0, 40)}</a>` : esc(g.title).slice(0, 40)}</span>
+      <span style="color:var(--sub);font-size:12px">${esc(g.reason)}</span>
+    </div>`).join("");
+  parts.push(`<div class="card"><b>同款组</b>${groups}
+    ${d.notes.map((n) => `<div class="rejected">△ ${esc(n)}</div>`).join("")}</div>`);
+
+  parts.push(filterBarHTML());
+
+  const excluded = Object.entries(d.candidates.excluded).map(([k, v]) => `${esc(k)} ${v}`).join("｜");
+  parts.push(`<div class="card"><b>到手价明细</b>
+    <div id="offerList"></div>
+    <div class="foot" id="filterHint"></div>
+    <div class="foot">${excluded ? "候选排除统计：" + excluded : ""}</div>
+    <div class="foot">※ 基于平台公开优惠测算，未含个性化券；价格实时变动，以结算页为准。数据来源：拼多多开放平台 / 京东联盟官方 API。</div>
+    ${d.trace ? `<div class="trace">${esc(d.trace)}</div>` : ""}
+  </div>`);
+
+  if (d.similar_items && d.similar_items.length) {
+    const similarRows = d.similar_items.map((s) => `
+      <div class="group">
+        ${s.image_url ? `<img class="thumb" src="${esc(s.image_url)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none'">` : ""}
+        <span class="pill">${esc(s.platform)}</span>
+        <span>${s.url ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title).slice(0, 42)}</a>` : esc(s.title).slice(0, 42)}</span>
+        <span class="price">￥${esc(s.price)}</span>
+        <span style="color:var(--sub);font-size:12px">${esc(s.reason)}</span>
+      </div>`).join("");
+    parts.push(`<div class="card"><b>近似款</b>（${d.similar_items.length} 条 · 未参与比价，仅供对比参考）${similarRows}</div>`);
+  }
+
+  $("out").innerHTML = parts.join("");
+  $("out").classList.remove("hidden");
+  $("out").querySelectorAll(".chip").forEach((element) => { element.onclick = onChip; });
+  renderOffers();
+}
+</script>
+</body>
+</html>

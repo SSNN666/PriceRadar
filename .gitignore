@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 本地配置与数据
+.env
+data/
+*.sqlite3
+
+# 会话导出：含完整对话全文、平台 AppKey/密钥值、手机号、requestId —— 绝不入库
+/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
+
+# 个人求职材料（该文件自身已注明：开源时须移出仓库或加入 .gitignore）
+docs/resume-strategy.md
+
+# 编辑器
+.idea/
+.vscode/
