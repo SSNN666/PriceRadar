@@ -12,6 +12,7 @@
   .wrap { max-width:760px; margin:0 auto; padding:28px 16px 60px; }
   h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--sub); font-size:13px; margin-bottom:20px; }
   .searchbar { display:flex; gap:8px; }
+  .hint { color:var(--sub); font-size:12px; margin-top:6px; line-height:1.5; }
   input[type=text] { flex:1; padding:12px 14px; border:1px solid #d8dde5; border-radius:10px; font-size:15px; outline:none; }
   input[type=text]:focus { border-color:var(--accent); }
   button { padding:12px 22px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-size:15px; cursor:pointer; }
@@ -72,11 +73,12 @@
 <body>
 <div class="wrap">
   <h1>真价雷达 <span style="font-size:13px;color:var(--sub)">· 到手价决策助手</span></h1>
-  <div class="sub">输入关键词或一句话 —— 跨平台公开优惠口径到手价 + 同款匹配（数据来自拼多多与京东联盟官方 API）</div>
+  <div class="sub">输入关键词，或<b>直接粘贴拼多多商品链接</b> —— 跨平台公开优惠口径到手价 + 同款匹配（数据来自拼多多与京东联盟官方 API）</div>
   <div class="searchbar">
-    <input id="q" type="text" placeholder="例如：帮我看看 QCY N20 降噪耳机哪里买划算" value="帮我看看QCY N20降噪耳机哪个平台买划算">
+    <input id="q" type="text" placeholder="例如：帮我看看 QCY N20 降噪耳机哪里买划算——或在此粘贴拼多多商品链接">
     <button id="go">查询</button>
   </div>
+  <div class="hint">粘贴拼多多链接可直接反查到那件商品，并自动扩展相似商品 —— <b>请原样粘贴</b>，手工删改参数（如 uin）会导致平台拒绝。</div>
   <div class="opts">
     <label><input id="useLlm" type="checkbox" checked> LLM 理解与总结</label>
     <label title="0=自动按品类选频道；-1=关闭京东侧">京东频道 <input id="jdCh" type="number" value="0" style="width:44px"></label>
@@ -502,6 +504,15 @@ function renderSimilar(d, anchorTitle) {
 function render(d) {
   lastData = d;
   const parts = [];
+  // 检索来源：粘链接时给出"已反查到哪件商品"的确认，否则显示实际使用的关键词
+  // （关键词可能经过 LLM 改写，不显示的话用户不知道系统理解成了什么）
+  if (d.keyword || d.source) {
+    const viaLink = /^https?:/i.test(d.keyword || "");
+    const label = viaLink ? "已按链接反查到" : "检索词";
+    const value = viaLink && d.source ? d.source.title : (d.keyword || "");
+    const meta = d.source ? `（${esc(d.source.platform)} 标价 ￥${esc(d.source.price)}）` : "";
+    parts.push(`<div class="card" style="padding:10px 18px"><span style="color:var(--sub);font-size:13px">${label}：</span><b>${esc(value)}</b> <span style="color:var(--sub);font-size:12px">${meta}</span></div>`);
+  }
   // 决策结论放最前——这是"数据展示"变"决策建议"的落点
   if (d.decision) {
     const t = d.decision;
