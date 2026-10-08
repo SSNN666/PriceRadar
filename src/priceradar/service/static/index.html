@@ -283,7 +283,9 @@ async function loadWatchlistStatus() {
             ${w.series && w.series.length > 1 ? sparkline(w.series) : ""}
             ${w.fake_discount ? `<span class="pill warn">△ 疑似先涨后降</span>` : ""}
           </div>`).join("")}
-          <div class="foot">※ 基于自观测数据（非平台全历史）；样本 &lt;14 天不出时机结论</div></div>`
+          <div class="foot">※ 基于自观测数据（非平台全历史）；样本 &lt;14 天不出时机结论</div>
+          <div class="foot">※ 拼多多网页端<b>不显示价格</b>（平台限制，会提示「前往 App 查看」）——点开商品链接只是为了去买，
+              <b>到手价上面已经算好了</b>，不必点开。京东链接可直接打开。</div></div>`
       : "";
   } catch (err) { /* 状态加载失败静默 */ }
 }
