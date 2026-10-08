@@ -88,6 +88,19 @@ def test_pipeline_empty_pool_raises():
         run("不存在", pdd_searcher=pdd_searcher_factory(), jd_enabled=False)
 
 
+def test_empty_pool_error_explains_category_gap_and_offers_a_way_out():
+    """拼多多有**类目空洞**（实测手机/平板/显示器/电视/键盘/鼠标返回空）。
+
+    报错必须说清"这是平台没货、不是故障"，并给出可行出路——否则用户以为程序坏了。
+    """
+    with pytest.raises(ValueError) as excinfo:
+        run("显示器", pdd_searcher=pdd_searcher_factory(), jd_enabled=False)
+    message = str(excinfo.value)
+    assert "显示器" in message
+    assert "不是故障" in message
+    assert "商品链接" in message          # 给出可操作的替代路径（链接反查已验证可用）
+
+
 def test_render_contains_all_sections():
     pool = [make_offer("a", PDD_N20_A, "99"), make_offer("b", PDD_N20_B, "105")]
     result = run("降噪耳机", pdd_searcher=pdd_searcher_factory(*pool), jd_searcher=jd_searcher_factory())

@@ -165,7 +165,19 @@ def run(
         pool = pdd_searcher(keyword, pdd_page_size)
     trace.count("pdd")
     if not pool:
-        raise ValueError(f"关键词 {keyword!r} 无检索结果")
+        # 拼多多侧存在**类目空洞**——实测「手机/平板/显示器/电视/键盘/鼠标」等整机与
+        # 外设类目返回空（total_count=0），而「保温杯/耳机/笔记本/音箱」等正常。
+        # 这是平台侧"屏蔽的类目&关键词"（见 search 的 block_cat_packages 参数），
+        # 不是故障，但必须把原因说清楚，否则用户会以为是程序坏了。
+        # 文案按纯文本渲染（前端 textContent），故不用 markdown 标记；
+        # 且不建议"换同品类的说法"——屏蔽的是类目，换词无效。
+        raise ValueError(
+            f"「{keyword}」在拼多多侧没有可比的商品。这通常是该品类没有进宝商品"
+            f"（实测：手机、平板、显示器、电视、键盘、鼠标等整机与外设类目均为空），不是故障。\n\n"
+            f"可以试试：\n"
+            f"· 换一个品类——日用品与配件类目有货（保温杯、耳机、音箱、充电宝等）\n"
+            f"· 直接粘贴拼多多商品链接——支持精确反查那件商品并自动扩展相似商品"
+        )
 
     jd_pool: list[Offer] = []
     jd_error: str | None = None
