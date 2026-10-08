@@ -76,9 +76,10 @@
   <div class="sub">输入关键词，或<b>直接粘贴拼多多商品链接</b> —— 跨平台公开优惠口径到手价 + 同款匹配（数据来自拼多多与京东联盟官方 API）</div>
   <div class="searchbar">
     <input id="q" type="text" placeholder="例如：帮我看看 QCY N20 降噪耳机哪里买划算——或在此粘贴拼多多商品链接">
+    <button id="pasteLink" class="ghost" title="从剪贴板读取拼多多商品链接并直接比价">粘贴链接</button>
     <button id="go">查询</button>
   </div>
-  <div class="hint">粘贴拼多多链接可直接反查到那件商品，并自动扩展相似商品 —— <b>请原样粘贴</b>，手工删改参数（如 uin）会导致平台拒绝。</div>
+  <div class="hint" id="qHint">粘贴拼多多链接可直接反查到那件商品，并自动扩展相似商品 —— <b>请原样粘贴</b>，手工删改参数（如 uin）会导致平台拒绝。</div>
   <div class="opts">
     <label><input id="useLlm" type="checkbox" checked> LLM 理解与总结</label>
     <label title="0=自动按品类选频道；-1=关闭京东侧">京东频道 <input id="jdCh" type="number" value="0" style="width:44px"></label>
@@ -116,6 +117,40 @@ async function readJson(resp) {
 $("go").onclick = search;
 $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
 $("snap").onclick = snapshot;
+$("pasteLink").onclick = pasteLink;
+
+// 拼多多链接识别（与后端 sources/links.py 同口径，宽松匹配整条 URL）
+const PDD_LINK_RE = /https?:\/\/[^\s<>"']*(?:yangkeduo\.com|pinduoduo\.com|pdd\.cn)[^\s<>"']*/i;
+const HINT_DEFAULT = $("qHint").innerHTML;   // 提示行被临时消息覆盖后需还原
+
+// 从剪贴板读取链接并直接比价。
+// 剪贴板读取可能被浏览器拒绝（权限/非安全上下文），必须留退路——
+// 读不到就聚焦输入框让用户手动 Ctrl+V，而不是静默失败。
+async function pasteLink() {
+  const hint = $("qHint");
+  const restore = () => { hint.innerHTML = HINT_DEFAULT; };
+  try {
+    const text = (await navigator.clipboard.readText()).trim();
+    if (!text) {
+      hint.textContent = "剪贴板是空的——先在拼多多 App 里「分享 → 复制链接」。";
+      return;
+    }
+    if (!PDD_LINK_RE.test(text)) {
+      // 剪贴板里不是拼多多链接：**不要覆盖用户已输入的内容**——按钮叫"粘贴链接"，
+      // 没链接就什么都不该动，只如实告知。
+      hint.textContent = "剪贴板里没有拼多多商品链接——本按钮只处理拼多多链接，其他内容请在输入框直接粘贴。";
+      $("q").focus();
+      return;
+    }
+    $("q").value = text;
+    restore();
+    search();
+  } catch (err) {
+    $("q").focus();
+    $("q").select();
+    hint.textContent = "浏览器拒绝了剪贴板读取（可能需要授权）——请直接在输入框按 Ctrl+V。";
+  }
+}
 $("vision").onclick = () => $("imgInput").click();
 $("coupon").onclick = () => $("couponInput").click();
 
