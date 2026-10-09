@@ -179,8 +179,12 @@ def record_all(scenarios: list[Scenario], *, client=None) -> list[dict]:
 # 回放
 # ============================================================
 
+class ReplayDriftError(RuntimeError):
+    """回放时循环行为与录制时不一致（响应没用完 / 结束原因变了）。"""
+
+
 class ReplayClient:
-    """按录制的顺序返回响应；耗尽即报错——那说明循环行为与录制时不一致。"""
+    """按录制的顺序返回响应。"""
 
     def __init__(self, replies: list[dict]):
         self.replies = list(replies)
@@ -217,8 +221,21 @@ def replay(cassette: dict, *, max_steps: int = loop.MAX_STEPS):
         return ActionResult(**outcomes.pop(0))
 
     stub_result = _stub_pipeline_result(cassette["query"])
+    client = ReplayClient(cassette.get("llm_replies", []))
     with patch.object(loop, "run_action", replayed_run_action), patch.object(loop, "compare_prices", lambda *a, **kw: stub_result):
-        return loop.run_agent(cassette["query"], client=ReplayClient(cassette.get("llm_replies", [])), max_steps=max_steps)
+        run = loop.run_agent(cassette["query"], client=client, max_steps=max_steps)
+
+    # ⚠️ **必须在这里显式检查漂移**：循环把 `chat` 的任何异常都降级处理（它的对外
+    # 承诺是「永不抛异常」），所以「回放耗尽」会被吞成一次干干净净的 llm_error 降级，
+    # 指标看起来完全正常——回放护栏就成了摆设。
+    if client.replies:
+        raise ReplayDriftError(f"还有 {len(client.replies)} 条录制响应未被消费——循环行为已与录制时不同")
+    if outcomes:
+        raise ReplayDriftError(f"还有 {len(outcomes)} 条录制的工具结果未被消费")
+    recorded_stop = cassette.get("observed", {}).get("stopped_by")
+    if recorded_stop and run.stopped_by != recorded_stop:
+        raise ReplayDriftError(f"结束原因变了：录制时是 {recorded_stop}，回放得到 {run.stopped_by}")
+    return run
 
 
 def _stub_pipeline_result(keyword: str):

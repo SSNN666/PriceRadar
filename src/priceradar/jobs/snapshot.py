@@ -22,7 +22,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable
 
-from priceradar.agent.tools import compute_best_price, search_jd_channel, search_pdd_goods
+from priceradar.agent.tools import (
+    compute_best_price,
+    search_jd_channel,
+    search_jd_goods,   # 品类路由：jd_elite_id 为空时的默认路径
+    search_pdd_goods,
+)
 from priceradar.config import project_root
 from priceradar.domain.models import Offer
 from priceradar.formatting import fmt_amount

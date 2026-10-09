@@ -22,6 +22,21 @@ from tests.test_llm import ScriptedTransport
 D = Decimal
 
 
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch):
+    """把降级兜底的 `loop.compare_prices` **默认打桩**。
+
+    起因：有两个用例只桩了 `run_action`，脚本化的「无工具调用」答复会走到
+    `no_tools` 降级，而那里的 `compare_prices` 是真的——于是每次 `pytest`
+    都会发出真实的 DeepSeek 与拼多多请求。花钱、烧配额，而且拼多多账号正是
+    项目文档里点名限流敏感的那个。
+
+    需要断言兜底行为的用例，在自己那里再 `monkeypatch.setattr` 覆盖即可
+    （后设置的赢）。
+    """
+    monkeypatch.setattr(loop, "compare_prices", lambda keyword, **kwargs: make_result(keyword))
+
+
 # ---------- 夹具 ----------
 
 def make_result(keyword="QCY N20") -> PipelineResult:
@@ -507,6 +522,41 @@ def test_trace_without_usage_falls_back_and_says_so(monkeypatch):
     loop.run_agent("x", client=client, trace=trace)
     assert trace.llm_cost_is_estimate is True
     assert "按次粗估" in trace.summary_line()
+
+
+def test_tool_defaults_reach_the_tool_call(monkeypatch):
+    """用户在界面上设的 jd_channel 必须真的到工具里。
+
+    模型不会主动传 `jd_channel`（它不在工具描述里被强调），所以循环要把它补进
+    模型**没给**的参数里——否则 Web 上「京东频道 = -1（关闭京东）」这种设置
+    在 Agent 模式下是摆设，同样的查询在降级路径上却生效，行为还不一致。
+    """
+    calls = patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    transport, client = make_agent(monkeypatch, call_tool("c1", "compare_prices", query="x"), answer("好"))
+    loop.run_agent("x", client=client, tool_defaults={"jd_channel": -1})
+
+    assert calls[0][1]["jd_channel"] == -1
+
+
+def test_model_supplied_argument_wins_over_default(monkeypatch):
+    """模型明确给了就听模型的——defaults 只补空缺。"""
+    calls = patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    transport, client = make_agent(monkeypatch, call_tool("c1", "compare_prices", query="x", jd_channel=24), answer("好"))
+    loop.run_agent("x", client=client, tool_defaults={"jd_channel": -1})
+    assert calls[0][1]["jd_channel"] == 24
+
+
+def test_trace_context_does_not_break_memo(monkeypatch):
+    """注入的 trace 不能进 memo 键——否则同一个调用永远不命中缓存。"""
+    calls = patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    transport, client = make_agent(
+        monkeypatch,
+        call_tool("c1", "compare_prices", query="x"),
+        call_tool("c2", "compare_prices", query="x"),
+        answer("好"),
+    )
+    loop.run_agent("x", client=client)
+    assert len(calls) == 1
 
 
 def test_char_budget_stops_the_loop(monkeypatch):

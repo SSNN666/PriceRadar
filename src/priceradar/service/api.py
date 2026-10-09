@@ -389,6 +389,10 @@ def execute_agent(
                 jd_channel=jd_channel,
                 use_risk=use_risk,
                 trace=trace,
+                # 用户在界面上设的京东频道必须**真的到工具里**：模型不会主动传
+                # `jd_channel`（它不在描述里强调），不补这一层，「关闭京东侧」
+                # 这类开关在 Agent 模式下就是摆设。
+                tool_defaults={"jd_channel": jd_channel},
             )
         except Exception as exc:  # 首个 chunk 之后异常处理器已失效，必须自己转成事件
             events.put({"type": "__error", "message": f"{type(exc).__name__}: {exc}"})

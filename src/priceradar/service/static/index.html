@@ -362,17 +362,35 @@ function newSession() {
   $("q").focus();
 }
 
+// 后端的 detail 有两种形状：我们抛的 HTTPException 是字符串，
+// pydantic 校验失败（422）是对象数组。直接 String() 会得到 "[object Object]"。
+function detailText(data, fallback) {
+  const detail = data && data.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((item) => (item && item.msg) || "").filter(Boolean);
+    if (parts.length) return parts.join("；");
+  }
+  return fallback;
+}
+
 // 「帮我盯着降价」：把上一轮的商品名加进每日快照的关注清单。
 // PRD §4.2 承诺过这个动作，但此前没有接口——点了只能是个死胡同。
 async function watchKeyword() {
-  const keyword = (lastData && lastData.keyword) || $("q").value.trim();
+  const keyword = ((lastData && lastData.keyword) || $("q").value.trim()).trim();
   if (!keyword) { renderSessionState("先查一个商品，再点「帮我盯着降价」"); return; }
+  if (/^https?:\/\//i.test(keyword)) {
+    // 链接查询的关键词就是链接本身（extract_keyword 会原样透传），拿它去关注没有意义：
+    // 既超出接口的 80 字上限，日后每日快照还会把整条 URL 当关键词去搜。
+    renderSessionState("这次查的是商品链接，没有可关注的关键词——先用商品名搜一次再点。");
+    return;
+  }
   try {
     const resp = await fetch("/api/watchlist", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword }),
     });
     const data = await readJson(resp);
-    if (!resp.ok) throw new Error(data.detail || "加入关注失败");
+    if (!resp.ok) throw new Error(detailText(data, "加入关注失败"));
     renderSessionState(data.note);
   } catch (err) {
     renderSessionState("加入关注失败：" + err.message);
@@ -456,9 +474,18 @@ function renderAgentAnswer(data) {
   box.classList.remove("hidden");
 }
 
+// ⚠️ 必须防重入。第二次 search() 会 close() 掉第一次的 EventSource，
+// 而它那个 promise 只由 final/error 事件来 settle——连接一关就永远不 settle，
+// 于是第一次查询被静默遗弃（不渲染、不报错），服务端却照跑完并**把同一个问题
+// 又存成一轮会话**：重复的历史 + 重复的检索与模型花费。
+// 回车键连按（或按键自动重复）很容易触发，所以在这里挡，而不是只靠按钮禁用。
+let searching = false;
+
 async function search() {
   const q = $("q").value.trim();
   if (!q) return;
+  if (searching) return;              // 上一次还没跑完，忽略这次提交
+  searching = true;
   const useAgent = $("useAgent").checked;
   $("go").disabled = true;
   $("error").classList.add("hidden");
@@ -484,6 +511,7 @@ async function search() {
     $("error").textContent = "出错了：" + err.message;
     $("error").classList.remove("hidden");
   } finally {
+    searching = false;
     $("go").disabled = false;
     $("status").classList.add("hidden");
   }

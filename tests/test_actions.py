@@ -23,6 +23,16 @@ from priceradar.sources.pdd import PddApiError
 D = Decimal
 
 
+@pytest.fixture(autouse=True)
+def offline_by_default(monkeypatch):
+    """**默认禁用 LLM**——否则任何走到 `compare_prices` 的用例都会真的去调 DeepSeek。
+
+    捕获方式：把 `socket.getaddrinfo` 拦掉再跑全套测试，这几个用例立刻现形。
+    光看代码看不出来——它们表面上都「打桩了」，只是桩在了 `run` 而没桩 LLM 客户端。
+    """
+    monkeypatch.setattr(actions, "_llm_client", lambda: None)
+
+
 # ---------- 夹具 ----------
 
 def make_offer(sku="a", title="QCY N20 降噪耳机", price="99", sign="SIGN_A") -> Offer:
@@ -129,13 +139,13 @@ def test_compare_prices_orchestrates_keyword_run_summary(monkeypatch, tmp_path):
     use_user_db(monkeypatch, tmp_path)
     seen = {}
 
-    def fake_extract(text, client=None):
+    def fake_extract(text, client=None, **kw):
         seen["text"] = text
         return "QCY N20", "rule"
 
     monkeypatch.setattr(actions, "extract_keyword", fake_extract)
     monkeypatch.setattr(actions, "run", lambda keyword, **kw: make_result())
-    monkeypatch.setattr(actions, "compose_summary", lambda result, client: ("已生成导语", "rule"))
+    monkeypatch.setattr(actions, "compose_summary", lambda result, client, **kw: ("已生成导语", "rule"))
 
     result = actions.compare_prices("帮我看看QCY N20哪里买划算", jd_channel=0)
     assert seen["text"] == "帮我看看QCY N20哪里买划算"   # 原样传给提取器（链接短路依赖这点）
@@ -154,8 +164,8 @@ def test_compare_prices_maps_jd_channel(monkeypatch, tmp_path):
         return make_result()
 
     monkeypatch.setattr(actions, "run", fake_run)
-    monkeypatch.setattr(actions, "extract_keyword", lambda text, client=None: (text, "rule"))
-    monkeypatch.setattr(actions, "compose_summary", lambda result, client: ("s", "rule"))
+    monkeypatch.setattr(actions, "extract_keyword", lambda text, client=None, **kw: (text, "rule"))
+    monkeypatch.setattr(actions, "compose_summary", lambda result, client, **kw: ("s", "rule"))
 
     actions.compare_prices("x", jd_channel=-1)
     assert captured["jd_enabled"] is False
@@ -172,9 +182,9 @@ def test_compare_prices_merges_user_coupons_and_notes_it(monkeypatch, tmp_path):
         tmp_path,
         [Coupon(coupon_id="u1", type=CouponType.PLATFORM, face_value=D("10"), threshold=D("50"), source="screenshot")],
     )
-    monkeypatch.setattr(actions, "extract_keyword", lambda text, client=None: (text, "rule"))
+    monkeypatch.setattr(actions, "extract_keyword", lambda text, client=None, **kw: (text, "rule"))
     monkeypatch.setattr(actions, "run", lambda keyword, **kw: make_result())
-    monkeypatch.setattr(actions, "compose_summary", lambda result, client: ("s", "rule"))
+    monkeypatch.setattr(actions, "compose_summary", lambda result, client, **kw: ("s", "rule"))
 
     result = actions.compare_prices("x")
     assert result.breakdowns[0][1].final_price == D("89")
@@ -193,10 +203,10 @@ def test_compare_prices_with_risk_clusters(monkeypatch, tmp_path):
         produced.risk = summary       # run() 在 with_risk=True 时会把扫描结果挂上去
         return produced
 
-    monkeypatch.setattr(actions, "extract_keyword", lambda text, client=None: (text, "rule"))
+    monkeypatch.setattr(actions, "extract_keyword", lambda text, client=None, **kw: (text, "rule"))
     monkeypatch.setattr(actions, "run", fake_run)
-    monkeypatch.setattr(actions, "compose_summary", lambda result, client: ("s", "rule"))
-    monkeypatch.setattr(actions, "cluster_issues", lambda risk, client: clustered)
+    monkeypatch.setattr(actions, "compose_summary", lambda result, client, **kw: ("s", "rule"))
+    monkeypatch.setattr(actions, "cluster_issues", lambda risk, client, **kw: clustered)
 
     result = actions.compare_prices("x", use_risk=True)
     assert result.risk is not None and result.risk.degraded is False
@@ -268,7 +278,7 @@ def test_scan_risk_clusters_with_llm(monkeypatch):
     clustered = RiskSummary(product="QCY N20", queries=["q"], items=[], issues=[], note="已聚类", degraded=False)
     monkeypatch.setattr(actions, "scan_with_env", lambda product: summary)
     monkeypatch.setattr(actions, "_llm_client", lambda: object())
-    monkeypatch.setattr(actions, "cluster_issues", lambda risk, client: clustered)
+    monkeypatch.setattr(actions, "cluster_issues", lambda risk, client, **kw: clustered)
     assert actions.scan_risk("QCY N20").degraded is False
 
 
@@ -435,6 +445,26 @@ def test_run_action_unknown_tool_is_not_retryable():
     assert outcome.ok is False
     assert "no_such_tool" in outcome.error
     assert outcome.retryable is False
+
+
+def test_run_action_rejects_undeclared_arguments(monkeypatch):
+    """模型自造的参数名必须被拒——不能让它绕过 schema 去改工具行为。
+
+    起因：`use_risk` 被**刻意**从 `compare_prices` 的 schema 里移除了（它与独立的
+    `scan_risk` 重叠，实测模型会把两者同时调一遍、白跑一次全网检索）。若 invoke 只
+    「校验已知字段、其余原样透传」，模型自己编一个 `use_risk=true` 就能重新打开它。
+    同一个洞还能让幻觉出来的 `db_path` 打开任意 sqlite 文件。
+    """
+    from priceradar.agent.actions import ActionArgumentError
+
+    outcome = actions.run_action("compare_prices", {"query": "x", "use_risk": True})
+    assert outcome.ok is False
+    assert "use_risk" in outcome.error
+    assert outcome.retryable is False
+    assert "schema" in outcome.hint
+
+    db_outcome = actions.run_action("check_price_history", {"keyword": "x", "db_path": "/etc/passwd"})
+    assert db_outcome.ok is True          # db_path 在白名单里（测试与命令行要用）
 
 
 def test_run_action_invalid_arguments_are_reported_not_raised():

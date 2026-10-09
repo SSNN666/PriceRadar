@@ -39,16 +39,22 @@ def _digest(text: str, model: str) -> str:
 
 
 class EmbeddingCache:
-    """极简磁盘缓存：{sha1: [float, ...]}。坏了就重来，不阻塞实验。"""
+    """极简磁盘缓存：{sha1: [float, ...]}。坏了就重来，不阻塞实验。
 
-    def __init__(self, path: Path | None = None) -> None:
+    `persist=False` 时只做内存缓存、完全不碰磁盘（`--no-cache` 用）。
+    ⚠️ 别用「把 path 传成 None」来表达这个意思——`None` 会被解析回默认路径，
+    结果既没绕过缓存、又会把已有缓存文件删掉。
+    """
+
+    def __init__(self, path: Path | None = None, *, persist: bool = True) -> None:
         self.path = Path(path or CACHE_PATH)
+        self.persist = persist
         self._data: dict[str, list[float]] = {}
         self._dirty = 0
         self.load()
 
     def load(self) -> None:
-        if not self.path.exists():
+        if not self.persist or not self.path.exists():
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -64,7 +70,7 @@ class EmbeddingCache:
         self._dirty += 1
 
     def flush(self, force: bool = False) -> None:
-        if not self._dirty and not force:
+        if not self.persist or (not self._dirty and not force):
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self._data), encoding="utf-8")

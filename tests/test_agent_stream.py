@@ -19,8 +19,14 @@ D = Decimal
 
 @pytest.fixture(autouse=True)
 def isolated_sessions(tmp_path, monkeypatch):
-    """会话库切到临时目录——否则测试会往真实的 data/sessions.db 里写垃圾。"""
+    """会话库与 trace 落盘都切到临时目录。
+
+    只隔离会话库是不够的：Agent 路径会往 `data/traces/agent.jsonl` 追加 trace，
+    跑一次测试就往真实埋点文件里塞几十行**伪造的 token 与成本**——
+    而那正是「单次查询成本 / P90」这份数据集的来源。
+    """
     monkeypatch.setattr(session_store, "DEFAULT_DB", tmp_path / "sessions.db")
+    monkeypatch.setattr(api_module, "AGENT_TRACE_PATH", tmp_path / "agent.jsonl")
     return tmp_path / "sessions.db"
 
 

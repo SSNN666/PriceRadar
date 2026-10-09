@@ -103,7 +103,7 @@ def list_sessions(connection: sqlite3.Connection, limit: int = 20) -> list[dict]
             "updated_at": updated_at,
             "turns": turns,
             "first_query": first_query or "",
-            "state": json.loads(state_json or "{}"),
+            "state": _parse_state(state_json),
         }
         for session_id, created_at, updated_at, state_json, turns, first_query in rows
     ]
@@ -117,15 +117,23 @@ def delete_session(connection: sqlite3.Connection, session_id: str) -> None:
 
 # ---------- 结构化槽位 ----------
 
-def load_state(connection: sqlite3.Connection, session_id: str) -> dict:
-    row = connection.execute("SELECT state_json FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    if row is None:
-        return {}
+def _parse_state(raw: str | None) -> dict:
+    """解析 state_json，坏数据返回空槽位。
+
+    **所有读 state_json 的地方都必须走这里**：一行坏数据不该让整个接口挂掉。
+    `list_sessions` 曾经漏了这层保护，于是 `GET /api/sessions` 会因为某一行
+    被写坏而整体 500。
+    """
     try:
-        state = json.loads(row[0] or "{}")
-    except json.JSONDecodeError:
+        state = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
         return {}
     return state if isinstance(state, dict) else {}
+
+
+def load_state(connection: sqlite3.Connection, session_id: str) -> dict:
+    row = connection.execute("SELECT state_json FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    return {} if row is None else _parse_state(row[0])
 
 
 def save_state(connection: sqlite3.Connection, session_id: str, state: dict) -> None:

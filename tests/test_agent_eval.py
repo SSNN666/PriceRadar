@@ -63,9 +63,40 @@ def test_replay_is_offline_and_reproduces_the_run(cassettes):
 def test_replay_consumes_all_recorded_responses(cassettes):
     """回放没用完的响应 = 循环行为已与录制时不同，必须暴露而不是静默通过。"""
     for cassette in cassettes:
-        run = replay(cassette)
-        # 直接断言不抛 LlmError（耗尽会抛）——由 replay 内部保证
-        assert run is not None
+        assert replay(cassette) is not None
+
+
+def test_replay_drift_is_actually_detected(cassettes):
+    """护栏必须**真的能响**——否则它只是看着好看。
+
+    这条曾经是摆设：`ReplayClient` 耗尽时抛 `LlmError`，而循环把那类异常
+    统一降级处理（对外承诺「永不抛异常」），于是「响应多了一条没被消费」
+    会被吞成一次干净的 `llm_error` 降级，`replay_errors` 永远是 0。
+    """
+    from evaluation.agent_eval import ReplayDriftError
+
+    cassette = json.loads(json.dumps(cassettes[0]))          # 深拷贝，别污染别的用例
+    cassette["llm_replies"].append({"content": "多余的响应", "finish_reason": "stop", "tool_calls": []})
+    with pytest.raises(ReplayDriftError, match="未被消费"):
+        replay(cassette)
+
+
+def test_replay_drift_detected_when_stop_reason_changes(cassettes):
+    from evaluation.agent_eval import ReplayDriftError
+
+    cassette = json.loads(json.dumps(cassettes[0]))
+    cassette["observed"]["stopped_by"] = "max_steps"          # 录制说触顶了
+    with pytest.raises(ReplayDriftError, match="结束原因变了"):
+        replay(cassette)
+
+
+def test_replay_exhaustion_surfaces_in_metrics(cassettes):
+    """指标层也要能看见漂移——`回放异常` 计数必须会响。"""
+    cassette = json.loads(json.dumps(cassettes[0]))
+    cassette["llm_replies"] = []                              # 一条响应都没有 → 必然耗尽
+    stats = evaluate([cassette])
+    assert stats["replay_errors"] == 1
+    assert stats["cases"][0]["error"]
 
 
 def test_tool_selection_accuracy_floor(cassettes):

@@ -33,7 +33,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 # —— 按**调用次数**计价的接口（元/次）。LLM 见下面的 LLM_PRICES，不在这里 ——
 API_UNIT_COST: dict[str, Decimal] = {
@@ -146,6 +146,24 @@ class Trace:
     def record_usage(self, *, prompt: int = 0, completion: int = 0, cache_hit: int = 0, cache_miss: int = 0) -> None:
         """记一次 LLM 调用的真实 token。由调用方从响应的 `usage` 里读出。"""
         self.tokens.record(prompt=prompt, completion=completion, cache_hit=cache_hit, cache_miss=cache_miss)
+
+    @property
+    def usage_sink(self) -> "Callable[[object], None]":
+        """给 `DeepSeekClient.complete(usage_sink=...)` 用的适配器。
+
+        工具内部的 LLM 调用（关键词提取 / 导语 / 风险聚类）也要计入——只统计循环
+        自己的几轮会让成本严重少报：一次 `scan_risk` 的博查检索是 ￥0.2，
+        比那几轮的 LLM 花费高两个数量级。
+        """
+        def sink(usage: object) -> None:
+            self.record_usage(
+                prompt=int(getattr(usage, "prompt_tokens", 0)),
+                completion=int(getattr(usage, "completion_tokens", 0)),
+                cache_hit=int(getattr(usage, "cache_hit_tokens", 0)),
+                cache_miss=int(getattr(usage, "cache_miss_tokens", 0)),
+            )
+
+        return sink
 
     @property
     def total_ms(self) -> int:

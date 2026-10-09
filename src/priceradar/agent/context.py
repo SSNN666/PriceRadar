@@ -19,16 +19,16 @@
 **不做滚动摘要**：64K 上下文配这类短会话，要很久才会撞到预算，而摘要本身
 既花钱又可能丢事实。先用「最近若干整轮 + 槽位 + 确定性裁剪」，等有真实会话
 长度数据再谈。
+
+裁剪策略：从**最老的一轮**开始整轮丢弃，直到装得下；连一轮都装不下就全丢光，
+只留固定前缀与槽位——**绝不把超预算的历史原样送出去**（那会在下一层被循环的
+上下文预算拦下，用户的问题根本没机会被模型看到）。
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, fields
-
-# 摘要兜底时保留的最小轮数——再少就不像对话了
-MIN_TURNS = 1
-
 
 @dataclass
 class SessionState:
@@ -135,26 +135,29 @@ def build_messages(
 
     kept = list(turns)
     dropped = 0
-    while True:
+    while kept:
         candidate = fixed + [message for turn in kept for message in turn] + tail
-        if _size(candidate) <= char_budget or len(kept) <= MIN_TURNS:
-            messages = candidate
-            break
-        kept.pop(0)          # 从最老的一轮整轮丢弃
+        if _size(candidate) <= char_budget:
+            return candidate, _trim_note(dropped, len(kept))
+        kept.pop(0)          # 从最老的一轮**整轮**丢弃
         dropped += 1
 
-    if not kept and turns:
-        # 连最小轮数都保不住（历史单轮就超预算）——丢光历史，只留槽位兜底
-        messages = fixed + tail
-        dropped = len(turns)
+    # 连一轮都放不下（单轮历史本身就超预算）→ 丢光历史，只留固定前缀 + 槽位兜底。
+    # 之前这里写作 `if not kept and turns`，但循环里的 `len(kept) <= MIN_TURNS`
+    # 让 kept 永远不为空，这段兜底根本走不到，超预算的历史被原样送了出去。
+    return fixed + tail, _trim_note(dropped, 0, all_dropped=True)
 
-    note = ""
-    if dropped:
-        note = (
-            f"为控制上下文长度，已省略本会话较早的 {dropped} 轮对话"
-            f"（保留最近 {len(kept)} 轮）；更早的结论若仍相关，请重新询问。"
-        )
-    return messages, note
+
+def _trim_note(dropped: int, kept_turns: int, *, all_dropped: bool = False) -> str:
+    """裁剪要如实告知，不能静默丢。"""
+    if not dropped:
+        return ""
+    if all_dropped:
+        return f"为控制上下文长度，本会话较早的 {dropped} 轮对话已全部省略；若仍相关请重新询问。"
+    return (
+        f"为控制上下文长度，已省略本会话较早的 {dropped} 轮对话"
+        f"（保留最近 {kept_turns} 轮）；更早的结论若仍相关，请重新询问。"
+    )
 
 
 # 供调用方复用的字段名清单（避免到处写字符串字面量）

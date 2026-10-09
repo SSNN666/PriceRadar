@@ -109,6 +109,7 @@ def compare_prices(
     *,
     use_llm: bool = True,
     llm_client: Any = _UNSET,
+    trace: Any = None,
 ) -> PipelineResult:
     """一个查询 → 完整比价结果（关键词理解 → 管线 → 用户券并入 → 导语 → 可选风险聚类）。
 
@@ -119,20 +120,22 @@ def compare_prices(
     use_llm：关闭后走全确定性兜底（CLI `--no-llm` 与 Web `llm=false` 用）。
     """
     client = (_llm_client() if use_llm else None) if llm_client is _UNSET else llm_client
+    sink = getattr(trace, "usage_sink", None)
     # 链接短路在 extract_keyword 内部（粘拼多多商品链接时原样透传，绝不清洗 URL）
-    keyword, _ = extract_keyword(query, client)
+    keyword, _ = extract_keyword(query, client, usage_sink=sink)
     result = run(
         keyword,
         jd_enabled=jd_channel >= 0,
         jd_elite_id=jd_channel if jd_channel > 0 else None,
         with_risk=use_risk,
+        trace=trace,          # 管线内部的分页/检索次数也计入同一条 trace
     )
     merged = apply_user_coupons(result)
     if merged:
         result.notes.append(f"已并入 {merged} 张用户补录券（明细含 [补录] 标记）")
-    result.summary, _ = compose_summary(result, client)
+    result.summary, _ = compose_summary(result, client, usage_sink=sink)
     if result.risk is not None:
-        result.risk = cluster_issues(result.risk, client)
+        result.risk = cluster_issues(result.risk, client, usage_sink=sink)
     return result
 
 
@@ -144,13 +147,15 @@ class SimilarResult:
     notes: list[str] = field(default_factory=list)
 
 
-def find_similar(goods_sign: str, limit: int = 20, *, llm_client: Any = _UNSET) -> SimilarResult:
+def find_similar(goods_sign: str, limit: int = 20, *, llm_client: Any = _UNSET, trace: Any = None) -> SimilarResult:
     """以商品为锚点找相似（平台原生 `channel_type=3`）。
 
     关键词搜「保温杯」会返回一堆款式各异的商品；以商品为锚点则由**平台自己**
     给出相似商品——这才对应「看到一件东西，想找一样的但更便宜的」。
     """
     offers = PddClient.from_env().recommend_similar(goods_sign, limit=limit)
+    if trace is not None:
+        trace.count("pdd")
     if not offers:
         raise ValueError("未找到相似商品（该商品可能已下架，或平台无相似推荐）")
 
@@ -165,14 +170,19 @@ def find_similar(goods_sign: str, limit: int = 20, *, llm_client: Any = _UNSET) 
     return SimilarResult(anchor_sign=goods_sign, breakdowns=breakdowns, merged_coupons=merged, notes=notes)
 
 
-def scan_risk(product: str, *, llm_client: Any = _UNSET) -> RiskSummary:
+def scan_risk(product: str, *, llm_client: Any = _UNSET, trace: Any = None) -> RiskSummary:
     """全网风险扫描（博查检索 → LLM 跨词聚类 → 覆盖声明）。
 
     无 LLM 时原样返回检索清单并保留 `degraded=True`——**如实标注未做归类**，
     不假装聚类过。
     """
     client = _llm_client() if llm_client is _UNSET else llm_client
-    return cluster_issues(scan_with_env(product), client)
+    summary = scan_with_env(product)
+    if trace is not None:
+        # 博查按次计费（￥0.05/次），一组关键词一次检索——**它是单次查询里最贵的部分**，
+        # 比循环自己的 LLM 花费高两个数量级，不计进来成本就是假的
+        trace.count("search_bocha", len(summary.queries))
+    return cluster_issues(summary, client, usage_sink=getattr(trace, "usage_sink", None))
 
 
 @dataclass(frozen=True)
@@ -358,6 +368,10 @@ class CheckPriceHistoryArgs(BaseModel):
     keyword: str = Field(description="要查观测历史的关键词（需在 data/watchlist.json 的关注范围内才有数据）")
 
 
+class ActionArgumentError(ValueError):
+    """工具入参不合法（多传、少传、类型错）。"""
+
+
 @dataclass(frozen=True)
 class Action:
     name: str
@@ -367,16 +381,30 @@ class Action:
     summarize: Callable[[Any], str]
     retry: str = "none"   # "none" | "once"
     cost_hint: str = ""
+    # 不在 LLM schema 里、但允许透传的内部参数（如 db_path）。
+    # **不在这个白名单里的参数一律拒绝**——见 invoke 的说明。
+    internal_params: frozenset[str] = frozenset()
 
-    def invoke(self, arguments: dict) -> Any:
+    def invoke(self, arguments: dict, *, context: dict | None = None) -> Any:
         """校验入参并执行。
 
-        `params` 只负责**LLM 可见参数**的校验；额外的内部参数（如 db_path）原样透传
-        ——这样测试可以注入路径，而模型看到的 schema 里不会有它。
+        ⚠️ 必须**白名单过滤**，不能让调用方传进来的键直接落到函数上。
+        起因：`use_risk` 被刻意从 `ComparePricesArgs` 里移除（它与独立的 `scan_risk`
+        能力重叠，实测模型会把两者同时调一遍、白跑一次全网检索）。但如果这里只做
+        「校验模型字段、其余原样透传」，模型只要自己编一个 `use_risk=true` 就能绕过
+        ——同样的道理，`db_path` 之类的内部参数也会被一个幻觉出来的键打开任意文件。
         """
+        allowed = set(self.params.model_fields) | set(self.internal_params)
+        unknown = sorted(set(arguments) - allowed)
+        if unknown:
+            raise ActionArgumentError(
+                f"不接受的参数：{'、'.join(unknown)}（可用：{'、'.join(sorted(allowed))}）"
+            )
         visible = {key: arguments[key] for key in self.params.model_fields if key in arguments}
         validated = self.params(**visible)
-        return self.func(**{**arguments, **validated.model_dump()})
+        # context 是**运行期注入**（如 trace），既不受白名单约束、也**不进 memo 键**
+        # ——否则同一个调用的键会因为 trace 对象不同而永远不命中
+        return self.func(**{**arguments, **validated.model_dump(), **(context or {})})
 
 
 ACTIONS: dict[str, Action] = {
@@ -432,6 +460,7 @@ ACTIONS: dict[str, Action] = {
             func=check_price_history,
             summarize=summarize_history,
             retry="none",
+            internal_params=frozenset({"db_path"}),   # 测试与命令行可注入路径；模型看不到
             cost_hint="毫秒级、零 API 花费",
         ),
     )
@@ -525,6 +554,8 @@ def explain_pdd_error(error: BaseException) -> str:
 
 
 def _hint_for(error: BaseException, retryable: bool) -> str:
+    if isinstance(error, ActionArgumentError):
+        return "参数不对：请严格按工具的参数 schema 重新发起，不要自造参数名。"
     if _ORIGINAL_LINK_MARKER in str(error):
         return _ORIGINAL_LINK_MESSAGE
     if isinstance(error, ValueError):   # 类目空洞 / 无结果
@@ -532,7 +563,13 @@ def _hint_for(error: BaseException, retryable: bool) -> str:
     return _HINT_TRANSIENT if retryable else _HINT_BUSINESS
 
 
-def run_action(name: str, arguments: dict, *, actions: dict[str, Action] | None = None) -> ActionResult:
+def run_action(
+    name: str,
+    arguments: dict,
+    *,
+    actions: dict[str, Action] | None = None,
+    context: dict | None = None,
+) -> ActionResult:
     """执行一个工具，**永不抛异常**——失败一律变成结构化结果喂回模型。
 
     为什么不让它抛：工具失败要能被模型看到并自行决策（换关键词 / 换工具 / 放弃），
@@ -553,7 +590,7 @@ def run_action(name: str, arguments: dict, *, actions: dict[str, Action] | None 
     last: BaseException | None = None
     for _ in range(attempts):
         try:
-            value = action.invoke(arguments)
+            value = action.invoke(arguments, context=context)
         except ValidationError as exc:
             return ActionResult(
                 ok=False,
@@ -587,6 +624,7 @@ def run_action(name: str, arguments: dict, *, actions: dict[str, Action] | None 
 
 __all__ = [
     "ACTIONS",
+    "ActionArgumentError",
     "SUMMARY_LIMIT",
     "Action",
     "ActionResult",

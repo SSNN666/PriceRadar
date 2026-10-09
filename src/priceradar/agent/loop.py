@@ -74,7 +74,13 @@ _STOP_REASON = {
     "max_steps": "达到轮次上限，已降级为确定性比价",
     "budget": "达到调用/上下文预算，已降级为确定性比价",
     "no_tools": "模型未调用任何工具，已降级为确定性比价",
+    "fallback_failed": "确定性兜底也失败了",
 }
+
+# 区分「调用方没传 client」与「显式传 None（= 禁用 LLM）」。
+# 不带哨兵的话，CLI 的 --no-llm 会被当成"没传"，然后被 _llm_client() 补上真实客户端
+# ——参数静默失效，还照样花钱。
+_UNSET: Any = object()
 
 _SKIPPED_NOTE = "该调用未被执行（超出本轮或本次请求的调用预算）。如需，请精简后在下一轮重新发起。"
 
@@ -198,7 +204,7 @@ def _emitter(on_event: Callable[[dict], None] | None) -> Callable[[dict], None]:
     return emit
 
 
-def _execute(memo: dict, call, trace: Trace) -> ToolExecution:
+def _execute(memo: dict, call, trace: Trace, defaults: dict | None = None) -> ToolExecution:
     """执行一个工具并把结果放进 memo。
 
     复用规则（三条都是刻意的）：
@@ -207,13 +213,16 @@ def _execute(memo: dict, call, trace: Trace) -> ToolExecution:
     - **可重试的失败 → 不复用**，允许模型再试一次；否则它看到 retryable=true
       想重试时会被缓存挡回去，恢复能力直接失效
     """
-    key = (call.name, _canonical(call.arguments))
+    # 用户设置（如 jd_channel）补进模型**没给**的参数——模型通常不会主动传它，
+    # 但 Web 上「京东频道=-1（关闭京东）」这类设置必须生效，否则界面上的开关是假的
+    arguments = {**defaults, **call.arguments} if defaults else dict(call.arguments)
+    key = (call.name, _canonical(arguments))
     cached = memo.get(key)
     if cached is not None and (cached.ok or not cached.retryable):
         return ToolExecution(
             id=call.id,
             name=call.name,
-            arguments=call.arguments,
+            arguments=arguments,
             ok=cached.ok,
             summary=cached.summary,
             error=cached.error,
@@ -223,12 +232,12 @@ def _execute(memo: dict, call, trace: Trace) -> ToolExecution:
             from_memo=True,
         )
 
-    with trace.span(f"tool:{call.name}", _canonical(call.arguments)[:60]):
-        outcome = run_action(call.name, call.arguments)
+    with trace.span(f"tool:{call.name}", _canonical(arguments)[:60]):
+        outcome = run_action(call.name, arguments, context={"trace": trace})
     fresh = ToolExecution(
         id=call.id,
         name=call.name,
-        arguments=call.arguments,
+        arguments=arguments,
         ok=outcome.ok,
         summary=outcome.summary,
         error=outcome.error,
@@ -257,14 +266,32 @@ def _degrade(
     trace: Trace,
     compare_kwargs: dict,
     messages: list[dict] | None = None,
+    detail: str = "",
 ) -> AgentRun:
     """降级：优先复用循环内已取得的比价结果，**绝不重跑**；一次都没有才真跑兜底。"""
     reason = _STOP_REASON.get(stopped_by, stopped_by)
+    if detail:
+        reason += f"（{detail}）"
     result = _memoized_result(memo)
     reused = result is not None
     if result is None:
-        with trace.span("fallback_pipeline", "确定性兜底"):
-            result = compare_prices(query, **compare_kwargs)
+        try:
+            with trace.span("fallback_pipeline", "确定性兜底"):
+                result = compare_prices(query, **compare_kwargs)
+        except Exception as exc:
+            # 兜底自己也会失败（类目空洞、接口不可用……）。对外承诺是「永不抛异常」——
+            # 宁可给一条如实说明的文字，也不能让异常打断整条 SSE 流。
+            trace.count("fallback_failed")
+            return AgentRun(
+                query=query,
+                stopped_by="fallback_failed",
+                final_text=f"{reason}：{type(exc).__name__}: {exc}",
+                steps=steps,
+                result=None,
+                usage=_usage_of(trace),
+                trace=trace,
+                messages=messages or [],
+            )
     result.notes.append(reason + ("（复用本轮已取得的结果）" if reused else ""))
     return AgentRun(
         query=query,
@@ -281,13 +308,14 @@ def _degrade(
 def run_agent(
     query: str,
     *,
-    client: Any = None,
+    client: Any = _UNSET,
     messages: list[dict] | None = None,
     on_event: Callable[[dict], None] | None = None,
     max_steps: int = MAX_STEPS,
     max_calls_per_step: int = MAX_CALLS_PER_STEP,
     max_tool_calls: int = MAX_TOOL_CALLS,
     char_budget: int = CHAR_BUDGET,
+    tool_defaults: dict | None = None,
     trace: Trace | None = None,
     **compare_kwargs: Any,
 ) -> AgentRun:
@@ -306,7 +334,7 @@ def run_agent(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": query},
     ]
-    if client is None:
+    if client is _UNSET:
         client = _llm_client()
     if client is None:
         return _degrade(
@@ -327,9 +355,16 @@ def run_agent(
         with trace.span("llm_chat", f"第 {index + 1} 轮"):
             try:
                 reply = client.chat(messages, tools=tool_schemas, max_tokens=MAX_TOKENS)
-            except LlmError as exc:
+            except Exception as exc:
+                # 用 Exception 而非 LlmError：对外承诺是「永不抛异常」，
+                # 传输层还没包装干净的异常类型（如代理返回非 JSON 触发的
+                # JSONDecodeError）也必须降级，不能把整条流打断
                 trace.count("llm_deepseek")
-                return _degrade(query, "llm_error", memo=memo, steps=steps, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
+                return _degrade(
+                    query, "llm_error", memo=memo, steps=steps, trace=trace,
+                    compare_kwargs=compare_kwargs, messages=messages,
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
         trace.count("llm_deepseek")
         # 真实 token 计量入 trace（缓存命中/未命中分项）——这是成本的大头，
         # 也是「固定前缀前置」这套设计唯一能被验证的地方
@@ -341,6 +376,9 @@ def run_agent(
         )
 
         if not reply.tool_calls:
+            # 把这条纯文本答复**也回填进 messages**：它才是本轮的结论。
+            # 不回填的话，落库的历史里只剩工具输出，下一轮追问就看不到上一轮怎么答的。
+            messages.append({"role": "assistant", "content": reply.content})
             if executed_total == 0:
                 return _degrade(query, "no_tools", memo=memo, steps=steps, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
             # ⚠️ 这里**刻意不发终止事件**：事件词汇表按层分开——本循环只发"进度"
@@ -376,7 +414,7 @@ def run_agent(
                 skipped_ids.append(call.id)
                 total_budget_exhausted = True
                 continue
-            execution = _execute(memo, call, trace)
+            execution = _execute(memo, call, trace, tool_defaults)
             if not execution.from_memo:
                 executed_total += 1
             step.tool_calls.append(execution)

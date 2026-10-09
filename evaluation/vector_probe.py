@@ -244,13 +244,10 @@ def main(argv: list[str] | None = None) -> None:
 
     from priceradar.matching.embeddings import DashScopeEmbedder
 
-    cache = EmbeddingCache()
-    if args.no_cache:
-        cache = EmbeddingCache(path=None)
-        try:
-            cache.path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    # --no-cache = 本次不读也不写缓存（强制重算，但**不动**已有的缓存文件）。
+    # 曾经写成 EmbeddingCache(path=None)：None 会被解析回默认路径，于是既没绕过
+    # 缓存、还把 data/embedding_cache.json 删了——下一次「走缓存」的运行又要全量重算。
+    cache = EmbeddingCache(persist=not args.no_cache)
     try:
         embedder = DashScopeEmbedder.from_env(cache=cache)
     except EmbeddingError as exc:

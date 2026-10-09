@@ -300,13 +300,27 @@ def test_dropped_turns_never_leave_half_a_turn():
         assert "已省略" in note
 
 
-def test_history_never_dropped_below_minimum_rounds():
+def test_oversized_history_is_dropped_entirely_not_sent_anyway():
+    """连一轮都装不下时必须**全丢**——绝不能把超预算的历史原样送出去。
+
+    之前那段兜底 (`if not kept and turns`) 是不可达的：循环条件里的
+    `len(kept) <= MIN_TURNS` 让 kept 永远不为空，于是超预算的历史被原样发出，
+    然后在下一层被循环的上下文预算拦下——用户的新问题根本没机会被模型看到。
+    """
     messages, note = build_messages(
         "S", SessionState(), turns_of("唯一一问" + "长" * 500), "新问", char_budget=50
     )
     assert messages[-1]["content"] == "新问"
-    # 预算小到极致时，宁可把历史全丢掉也不能把消息列表搞坏
-    assert all(message["role"] in ("system", "user", "assistant", "tool") for message in messages)
+    assert len(messages) == 2, "超预算的历史应当被全部丢掉"
+    assert "全部省略" in note
+    assert not any("唯一一问" in (m.get("content") or "") for m in messages)
+
+
+def test_trim_note_reports_how_many_were_dropped():
+    turns = turns_of(*[f"第{i}问" + "长" * 200 for i in range(4)])
+    messages, note = build_messages("S", SessionState(), turns, "新问", char_budget=600)
+    assert "已省略" in note
+    assert "轮对话" in note
 
 
 def test_build_messages_with_no_history(tmp_path):
