@@ -140,6 +140,32 @@ def test_system_prompt_is_a_fixed_prefix(monkeypatch):
     assert first[1] == {"role": "user", "content": "随便什么查询"}
 
 
+def test_custom_messages_are_used_for_multi_turn(monkeypatch):
+    """多轮：调用方（Context Builder）组装好完整消息列表，循环只在副本上追加。"""
+    patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    transport, client = make_agent(monkeypatch, call_tool("c1", "compare_prices", query="x"), answer("好"))
+    history = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "system", "content": "【本会话已知的当前对象】商品「QCY N20」"},
+        {"role": "user", "content": "上一问"},
+        {"role": "assistant", "content": "上一答"},
+        {"role": "user", "content": "那有没有踩坑的"},
+    ]
+    run = loop.run_agent("那有没有踩坑的", client=client, messages=history)
+
+    assert transport.calls[0]["messages"][:5] == history       # 原样送出
+    assert history[-1]["content"] == "那有没有踩坑的"           # 传入的列表未被就地改写
+    assert len(run.messages) > len(history)                    # 返回值带完整消息列表
+
+
+def test_run_messages_start_with_system_in_single_turn(monkeypatch):
+    patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    transport, client = make_agent(monkeypatch, answer("好"))
+    run = loop.run_agent("x", client=client)
+    assert run.messages[0]["role"] == "system"
+    assert run.messages[1] == {"role": "user", "content": "x"}
+
+
 def test_tools_schema_is_sent_every_round(monkeypatch):
     """工具定义同样属于缓存前缀，必须每轮原样重发（顺序固定）。"""
     patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})

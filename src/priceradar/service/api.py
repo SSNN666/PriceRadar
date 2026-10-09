@@ -20,6 +20,7 @@ from typing import Iterator
 
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from priceradar.agent import actions
 from priceradar.agent.actions import compare_prices
@@ -244,12 +245,90 @@ def _sse(event: dict, *, event_id: int | None = None) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+KEEP_TURNS = 3              # 上下文里保留的最近完整轮数
+CONTEXT_CHAR_BUDGET = 16000  # 组装历史时的预算（给本轮工具结果留出余量）
+
+
+def _prepare_session(query: str, session_id: str | None) -> tuple[str, int, list[dict], str]:
+    """准备会话：取槽位与历史 → 组装本轮消息 → 落一条 user 消息。
+
+    返回 `(session_id, turn_id, messages, trim_note)`。全部是本地 sqlite 操作，毫秒级。
+    """
+    from priceradar.agent.context import SessionState, build_messages
+    from priceradar.agent.loop import SYSTEM_PROMPT
+    from priceradar.agent.session_store import (
+        append_message,
+        connect_session_db,
+        load_state,
+        load_turns,
+        new_session,
+        next_turn_id,
+        session_exists,
+    )
+
+    connection = connect_session_db()
+    try:
+        sid = session_id or new_session(connection)
+        if not session_exists(connection, sid):
+            new_session(connection, sid)
+        state = SessionState.from_dict(load_state(connection, sid))
+        turns = load_turns(connection, sid, keep_turns=KEEP_TURNS)
+        messages, trim_note = build_messages(
+            SYSTEM_PROMPT, state, turns, query, char_budget=CONTEXT_CHAR_BUDGET
+        )
+        turn_id = next_turn_id(connection, sid)
+        append_message(connection, sid, role="user", turn_id=turn_id, content=query)
+        return sid, turn_id, messages, trim_note
+    finally:
+        connection.close()
+
+
+def _persist_turn(session_id: str, turn_id: int, run, initial_messages: list[dict]) -> None:
+    """把本轮新产生的 assistant / tool 消息与更新后的槽位落库。
+
+    落库失败不能影响已经拿到的结果——由调用方转成提示事件。
+    """
+    from priceradar.agent.context import SessionState, update_state
+    from priceradar.agent.session_store import (
+        append_message,
+        connect_session_db,
+        load_state,
+        prune,
+        save_state,
+    )
+
+    produced = list(run.messages[len(initial_messages):]) if len(run.messages) > len(initial_messages) else []
+    if not produced and run.final_text:
+        # 降级路径可能一条助手消息都没产生（例如 LLM 不可用）——补一条，
+        # 否则下一轮会读到「只有用户发言」的半截历史
+        produced = [{"role": "assistant", "content": run.final_text}]
+
+    connection = connect_session_db()
+    try:
+        for message in produced:
+            append_message(
+                connection,
+                session_id,
+                role=message["role"],
+                turn_id=turn_id,
+                content=message.get("content"),
+                tool_calls=message.get("tool_calls"),
+                tool_call_id=message.get("tool_call_id"),
+            )
+        state = update_state(SessionState.from_dict(load_state(connection, session_id)), run)
+        save_state(connection, session_id, state.to_dict())
+        prune(connection, session_id)
+    finally:
+        connection.close()
+
+
 def execute_agent(
     query: str,
     jd_channel: int = 0,
     use_llm: bool = True,
     use_risk: bool = False,
     *,
+    session_id: str | None = None,
     heartbeat: float = 15.0,
 ) -> Iterator[str]:
     """Agent 循环 → SSE 帧的**同步生成器**。
@@ -272,18 +351,38 @@ def execute_agent(
         yield _sse(_final_event(query, jd_channel, use_risk, llm_client=None), event_id=1)
         return
 
+    sid, turn_id, messages, trim_note = _prepare_session(query, session_id)
+
     events: Queue[dict] = Queue()
+    prelude: list[dict] = [{"type": "session", "session_id": sid}]
+    if trim_note:
+        prelude.append({"type": "notice", "message": trim_note})
 
     def worker() -> None:
         try:
-            run = run_agent(query, on_event=events.put, jd_channel=jd_channel, use_risk=use_risk)
-            events.put({"type": "__done", "run": run})
+            run = run_agent(
+                query,
+                messages=messages,
+                on_event=events.put,
+                jd_channel=jd_channel,
+                use_risk=use_risk,
+            )
         except Exception as exc:  # 首个 chunk 之后异常处理器已失效，必须自己转成事件
             events.put({"type": "__error", "message": f"{type(exc).__name__}: {exc}"})
+            return
+        try:
+            _persist_turn(sid, turn_id, run, messages)
+        except Exception as exc:  # 落库失败不能吞掉已经拿到的结果，如实提示
+            events.put({"type": "notice", "message": f"本轮对话未能存入会话（不影响结果）：{exc}"})
+        events.put({"type": "__done", "run": run})
 
     threading.Thread(target=worker, daemon=True).start()
 
     counter = 0
+    for event in prelude:
+        counter += 1
+        yield _sse(event, event_id=counter)
+
     while True:
         try:
             event = events.get(timeout=heartbeat)
@@ -293,7 +392,7 @@ def execute_agent(
         if event["type"] == "__done":
             run = event["run"]
             counter += 1
-            yield _sse(_agent_result_event(run, jd_channel, use_risk), event_id=counter)
+            yield _sse(_agent_result_event(run, jd_channel, use_risk, session_id=sid), event_id=counter)
             return
         if event["type"] == "__error":
             counter += 1
@@ -308,7 +407,7 @@ def execute_agent(
         yield _sse(event, event_id=counter)
 
 
-def _agent_result_event(run, jd_channel: int, use_risk: bool) -> dict:
+def _agent_result_event(run, jd_channel: int, use_risk: bool, *, session_id: str = "") -> dict:
     """终帧：既有前端 payload + Agent 自己的元信息。"""
     payload = to_payload(run.result) if run.result is not None else None
     return {
@@ -318,6 +417,7 @@ def _agent_result_event(run, jd_channel: int, use_risk: bool) -> dict:
         "final_text": run.final_text,
         "tools": [execution.name for step in run.steps for execution in step.tool_calls],
         "rounds": len(run.steps),
+        "session_id": session_id,
         "usage": {
             "prompt_tokens": run.usage.prompt_tokens,
             "completion_tokens": run.usage.completion_tokens,
@@ -348,16 +448,61 @@ def api_agent_stream(
     jd_channel: int = 0,
     llm: bool = True,
     risk: bool = False,
+    session_id: str | None = Query(None, description="会话 ID；不传则新建，追问时带上上一轮返回的那个"),
 ) -> StreamingResponse:
     """Agent 流式查询：边跑边推工具进度，最后给完整 payload。
 
     响应头三件套（部署到 nginx 时缺 `X-Accel-Buffering: no` 流会被缓冲成一坨）。
     """
     return StreamingResponse(
-        execute_agent(q, jd_channel=jd_channel, use_llm=llm, use_risk=risk),
+        execute_agent(q, jd_channel=jd_channel, use_llm=llm, use_risk=risk, session_id=session_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+@app.get("/api/sessions")
+def api_list_sessions(limit: int = 20) -> dict:
+    """最近的会话（供「继续上次」用）。"""
+    from priceradar.agent.session_store import connect_session_db, list_sessions
+
+    connection = connect_session_db()
+    try:
+        return {"sessions": list_sessions(connection, limit=limit)}
+    finally:
+        connection.close()
+
+
+@app.get("/api/sessions/{session_id}")
+def api_get_session(session_id: str) -> dict:
+    """单个会话的消息与槽位（刷新页面后恢复对话用）。"""
+    from priceradar.agent.session_store import connect_session_db, load_state, load_turns, session_exists
+
+    connection = connect_session_db()
+    try:
+        if not session_exists(connection, session_id):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {
+            "session_id": session_id,
+            "state": load_state(connection, session_id),
+            "turns": load_turns(connection, session_id, keep_turns=None),
+        }
+    finally:
+        connection.close()
+
+
+@app.delete("/api/sessions/{session_id}")
+def api_delete_session(session_id: str) -> dict:
+    """删除会话（消息与槽位一并删除）。"""
+    from priceradar.agent.session_store import connect_session_db, delete_session, session_exists
+
+    connection = connect_session_db()
+    try:
+        existed = session_exists(connection, session_id)
+        delete_session(connection, session_id)
+    finally:
+        connection.close()
+    return {"deleted": existed, "session_id": session_id}
 
 
 def execute_snapshot() -> dict:
@@ -495,6 +640,52 @@ def watchlist_status(db_path: Path | None = None) -> dict:
 def api_watchlist_status() -> dict:
     """快照按钮配套：今日采集状态 + 降价提醒清单 + 关注面板。"""
     return watchlist_status()
+
+
+class WatchRequest(BaseModel):
+    keyword: str = Field(min_length=1, max_length=80, description="要关注的检索关键词")
+
+
+@app.get("/api/watchlist")
+def api_get_watchlist() -> dict:
+    """关注清单（每日快照采集的输入）。
+
+    PRD §4.2 承诺的「帮我盯着降价」原先没有落点——只能手改
+    `data/watchlist.json`，多轮 UI 上点它就是个死胡同。这三个接口把它补上。
+    """
+    from priceradar.jobs.snapshot import load_watchlist
+
+    watchlist = load_watchlist()
+    return {"keywords": watchlist.get("keywords", []), "jd_elite_id": watchlist.get("jd_elite_id", 0)}
+
+
+@app.post("/api/watchlist")
+def api_add_watch(item: WatchRequest) -> dict:
+    """加入关注清单（幂等：已存在时不重复添加）。"""
+    from priceradar.jobs.snapshot import add_watch_keyword
+
+    try:
+        keywords, added = add_watch_keyword(item.keyword)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "keywords": keywords,
+        "added": added,
+        "note": f"已关注「{item.keyword}」，下次采集快照时一并采集" if added else f"「{item.keyword}」已在关注清单里",
+    }
+
+
+@app.delete("/api/watchlist")
+def api_remove_watch(keyword: str = Query(..., min_length=1)) -> dict:
+    """从关注清单移除（已采集的历史数据**不受影响**，只是不再继续跟踪）。"""
+    from priceradar.jobs.snapshot import remove_watch_keyword
+
+    keywords, removed = remove_watch_keyword(keyword)
+    return {
+        "keywords": keywords,
+        "removed": removed,
+        "note": f"已取消关注「{keyword}」（历史快照仍保留）" if removed else f"「{keyword}」不在关注清单里",
+    }
 
 
 def execute_vision(image_bytes: bytes, media_type: str, mode: str) -> dict:

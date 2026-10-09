@@ -4,8 +4,10 @@ import json
 import time
 from decimal import Decimal
 
+import pytest
 from fastapi.testclient import TestClient
 
+import priceradar.agent.session_store as session_store
 import priceradar.service.api as api_module
 from priceradar.agent.loop import AgentRun, AgentStep, ToolExecution
 from priceradar.agent.pipeline import ConfirmedItem, OfferGroup, PipelineResult
@@ -13,6 +15,13 @@ from priceradar.domain.models import Offer, Platform
 from priceradar.engine.pricing import compute_price
 
 D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def isolated_sessions(tmp_path, monkeypatch):
+    """会话库切到临时目录——否则测试会往真实的 data/sessions.db 里写垃圾。"""
+    monkeypatch.setattr(session_store, "DEFAULT_DB", tmp_path / "sessions.db")
+    return tmp_path / "sessions.db"
 
 
 def make_result(keyword="QCY N20") -> PipelineResult:
@@ -42,7 +51,10 @@ def make_run(*, stopped_by="finish", with_result=True) -> AgentRun:
                 index=0,
                 content="我来查一下",
                 tool_calls=[
-                    ToolExecution(id="c1", name="compare_prices", arguments={"query": "QCY N20"}, ok=True, summary="比价摘要")
+                    # value 是工具的**真实返回值**——槽位只从这里取（确定性事实），
+                    # 不从模型给的参数里猜
+                    ToolExecution(id="c1", name="compare_prices", arguments={"query": "QCY N20"},
+                                  ok=True, summary="比价摘要", value=make_result())
                 ],
             )
         ],
@@ -98,9 +110,10 @@ def test_stream_emits_steps_tools_and_final(monkeypatch):
     resp = TestClient(api_module.app).get("/api/agent/stream", params={"q": "QCY N20"})
     assert resp.status_code == 200
     events = frames(resp.text)
-    assert [event["type"] for event in events] == ["step", "tool", "final"]
-    assert events[1]["name"] == "compare_prices"
-    assert events[1]["summary"] == "比价摘要"
+    assert [event["type"] for event in events] == ["session", "step", "tool", "final"]
+    assert events[0]["session_id"]                                  # 首帧带会话 ID，前端据此续接
+    assert events[2]["name"] == "compare_prices"
+    assert events[2]["summary"] == "比价摘要"
 
 
 def test_final_event_carries_payload_and_agent_metadata(monkeypatch):
@@ -149,7 +162,7 @@ def test_runner_emitting_a_rogue_final_is_dropped(monkeypatch):
         {"type": "tool", "index": 0, "name": "compare_prices", "ok": True, "summary": "s"},
     ])
     events = frames(TestClient(api_module.app).get("/api/agent/stream", params={"q": "x"}).text)
-    assert [event["type"] for event in events] == ["tool", "final"]
+    assert [event["type"] for event in events] == ["session", "tool", "final"]
     assert events[-1]["payload"] is not None
 
 
@@ -234,6 +247,139 @@ def test_params_are_forwarded_to_the_runner(monkeypatch):
 
 def test_missing_query_is_rejected():
     assert TestClient(api_module.app).get("/api/agent/stream").status_code == 422
+
+
+# ============================================================
+# 多轮会话
+# ============================================================
+
+def capture_runner(monkeypatch, run=None):
+    """记录 runner 收到的 kwargs（尤其是 messages），返回该列表。"""
+    seen: list[dict] = []
+
+    def fake(query, on_event=None, **kwargs):
+        seen.append({"query": query, **kwargs})
+        return run if run is not None else make_run()
+
+    monkeypatch.setattr(api_module, "run_agent", fake)
+    return seen
+
+
+def test_first_turn_creates_a_session_and_persists_the_turn(monkeypatch):
+    capture_runner(monkeypatch, make_run())
+    events = frames(TestClient(api_module.app).get("/api/agent/stream", params={"q": "QCY N20 哪里买"}).text)
+    sid = events[0]["session_id"]
+    assert sid and events[-1]["session_id"] == sid
+
+    from priceradar.agent.session_store import connect_session_db, load_turns
+
+    connection = connect_session_db()
+    try:
+        turns = load_turns(connection, sid, keep_turns=None)
+    finally:
+        connection.close()
+    assert len(turns) == 1
+    assert turns[0][0] == {"role": "user", "content": "QCY N20 哪里买"}
+
+
+def test_second_turn_reuses_the_session_and_sends_history(monkeypatch):
+    """追问必须带上历史——这正是「多轮」的意义所在。"""
+    seen = capture_runner(monkeypatch, make_run())
+    client = TestClient(api_module.app)
+    sid = frames(client.get("/api/agent/stream", params={"q": "QCY N20 哪里买"}).text)[0]["session_id"]
+
+    client.get("/api/agent/stream", params={"q": "那有没有踩坑的", "session_id": sid})
+
+    assert len(seen) == 2
+    first_messages = seen[0]["messages"]
+    second_messages = seen[1]["messages"]
+    assert len(second_messages) > len(first_messages), "第二轮必须比第一轮多带历史"
+    contents = [message.get("content") for message in second_messages]
+    assert "QCY N20 哪里买" in contents          # 上一轮的提问还在
+    assert second_messages[-1] == {"role": "user", "content": "那有没有踩坑的"}
+
+
+def test_a_new_session_does_not_see_the_previous_one(monkeypatch):
+    """不传 session_id 就是新会话——历史不能串味。"""
+    seen = capture_runner(monkeypatch, make_run())
+    client = TestClient(api_module.app)
+    client.get("/api/agent/stream", params={"q": "第一问"})
+    client.get("/api/agent/stream", params={"q": "第二问"})       # 不带 session_id
+    assert seen[1]["messages"][-1] == {"role": "user", "content": "第二问"}
+    assert not any(message.get("content") == "第一问" for message in seen[1]["messages"])
+
+
+def test_state_carries_the_current_object_across_turns(monkeypatch):
+    """槽位是历史被裁掉后仍然活下来的锚点——追问「那有没有坑」时模型得知道在说哪个商品。"""
+    capture_runner(monkeypatch, make_run())
+    client = TestClient(api_module.app)
+    sid = frames(client.get("/api/agent/stream", params={"q": "QCY N20 哪里买"}).text)[0]["session_id"]
+
+    from priceradar.agent.session_store import connect_session_db, load_state
+
+    connection = connect_session_db()
+    try:
+        state = load_state(connection, sid)
+    finally:
+        connection.close()
+    assert state.get("keyword") == "QCY N20"
+    assert state.get("goods_sign") == "SIGN_A"
+
+
+def test_degraded_run_still_leaves_an_assistant_message(monkeypatch):
+    """降级时也要落一条助手消息，否则下一轮会读到「只有用户发言」的半截历史。"""
+    capture_runner(monkeypatch, make_run(stopped_by="llm_error"))
+    client = TestClient(api_module.app)
+    sid = frames(client.get("/api/agent/stream", params={"q": "第一问"}).text)[0]["session_id"]
+
+    from priceradar.agent.session_store import connect_session_db, load_turns
+
+    connection = connect_session_db()
+    try:
+        turns = load_turns(connection, sid, keep_turns=None)
+    finally:
+        connection.close()
+    assert [message["role"] for message in turns[0]] == ["user", "assistant"]
+
+
+def test_session_endpoints(monkeypatch):
+    capture_runner(monkeypatch, make_run())
+    client = TestClient(api_module.app)
+    sid = frames(client.get("/api/agent/stream", params={"q": "QCY N20"}).text)[0]["session_id"]
+
+    listing = client.get("/api/sessions").json()
+    assert any(item["id"] == sid for item in listing["sessions"])
+
+    detail = client.get(f"/api/sessions/{sid}").json()
+    assert detail["session_id"] == sid
+    assert detail["state"]["keyword"] == "QCY N20"
+
+    assert client.delete(f"/api/sessions/{sid}").json()["deleted"] is True
+    assert client.get(f"/api/sessions/{sid}").status_code == 404
+
+
+def test_unknown_session_id_is_adopted(monkeypatch):
+    """伪造/过期的 session_id 不该报错——直接建一个同 ID 的新会话。"""
+    capture_runner(monkeypatch, make_run())
+    events = frames(
+        TestClient(api_module.app).get("/api/agent/stream", params={"q": "x", "session_id": "deadbeef"}).text
+    )
+    assert events[0]["session_id"] == "deadbeef"
+
+
+def test_persistence_failure_does_not_lose_the_result(monkeypatch):
+    """会话落库失败不能吞掉已经拿到的结果，只提示。"""
+    capture_runner(monkeypatch, make_run())
+    import priceradar.service.api as module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("磁盘满了")
+
+    monkeypatch.setattr(module, "_persist_turn", boom)
+    events = frames(TestClient(api_module.app).get("/api/agent/stream", params={"q": "x"}).text)
+    assert events[-1]["type"] == "final"                       # 结果照常给出
+    assert events[-1]["payload"] is not None
+    assert any("未能存入会话" in (event.get("message") or "") for event in events)
 
 
 # ============================================================

@@ -80,6 +80,9 @@
   .agent-answer { margin-top:12px; padding-top:12px; border-top:1px solid #eef1f5; }
   .agent-meta { color:var(--sub); font-size:12px; }
   .agent-text { white-space:pre-wrap; font-size:14px; margin-top:6px; }
+  .session-bar { display:flex; gap:8px; align-items:center; margin-top:8px; font-size:12px; color:var(--sub); }
+  .session-bar .dot { width:7px; height:7px; border-radius:50%; background:#c8cfd9; display:inline-block; margin-right:5px; }
+  .session-bar .dot.on { background:var(--good); }
 </style>
 </head>
 <body>
@@ -97,6 +100,11 @@
     <label><input id="useLlm" type="checkbox" checked> LLM 理解与总结</label>
     <label title="0=自动按品类选频道；-1=关闭京东侧">京东频道 <input id="jdCh" type="number" value="0" style="width:44px"></label>
     <label title="Agent 模式下由它自己判断要不要扫风险；这里只影响非 Agent 模式"><input id="useRisk" type="checkbox"> 风险扫描（约 ¥0.2/次）</label>
+  </div>
+  <div class="session-bar">
+    <span id="sessionState"><span class="dot"></span>新会话（Agent 模式下的追问会承接上文）</span>
+    <button id="newSession" class="ghost" title="清空当前会话上下文，下一次提问重新开始">新会话</button>
+    <button id="watchKeyword" class="ghost" title="把上一个查询的商品加进每日价格快照的关注清单，之后可对比历史价">帮我盯着降价</button>
   </div>
   <div class="toolbar">
     <button id="snap" class="ghost" title="按关注清单（data/watchlist.json）采集当日到手价；同日重复自动幂等跳过">采集今日快照</button>
@@ -324,6 +332,53 @@ function sparkline(series) {
 const TOOL_LABELS = { compare_prices: "跨平台比价", find_similar: "找相似商品", scan_risk: "风险扫描", check_price_history: "价格观测" };
 let agentSource = null;
 
+// 会话 ID 存 localStorage：刷新页面后还能接着上一轮问（会话本身在服务端库里）
+const SESSION_KEY = "priceradar_session";
+let sessionId = "";
+try { sessionId = localStorage.getItem(SESSION_KEY) || ""; } catch { sessionId = ""; }
+
+function setSessionId(id) {
+  sessionId = id || "";
+  try { sessionId ? localStorage.setItem(SESSION_KEY, sessionId) : localStorage.removeItem(SESSION_KEY); } catch { /* 隐私模式下 localStorage 可能不可用 */ }
+  renderSessionState();
+}
+
+function renderSessionState(text) {
+  const box = $("sessionState");
+  if (!box) return;
+  if (text) { box.innerHTML = `<span class="dot on"></span>${esc(text)}`; return; }
+  box.innerHTML = sessionId
+    ? `<span class="dot on"></span>进行中的会话 ${esc(sessionId.slice(0, 8))} —— 追问会承接上文`
+    : `<span class="dot"></span>新会话（Agent 模式下的追问会承接上文）`;
+}
+
+function newSession() {
+  setSessionId("");
+  $("agent-out").innerHTML = "";
+  $("out").innerHTML = "";
+  $("out").classList.add("hidden");
+  $("similar-out").innerHTML = "";
+  lastData = null;
+  $("q").focus();
+}
+
+// 「帮我盯着降价」：把上一轮的商品名加进每日快照的关注清单。
+// PRD §4.2 承诺过这个动作，但此前没有接口——点了只能是个死胡同。
+async function watchKeyword() {
+  const keyword = (lastData && lastData.keyword) || $("q").value.trim();
+  if (!keyword) { renderSessionState("先查一个商品，再点「帮我盯着降价」"); return; }
+  try {
+    const resp = await fetch("/api/watchlist", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword }),
+    });
+    const data = await readJson(resp);
+    if (!resp.ok) throw new Error(data.detail || "加入关注失败");
+    renderSessionState(data.note);
+  } catch (err) {
+    renderSessionState("加入关注失败：" + err.message);
+  }
+}
+
 function agentPanelHTML() {
   return `<div class="card agent"><b>Agent 正在工作…</b><div id="agentTrace"></div>
     <div id="agentAnswer" class="agent-answer hidden"></div></div>`;
@@ -341,6 +396,8 @@ function renderAgentEvent(event) {
     html = `<div class="agent-tool ${event.ok ? "ok" : "bad"}">${event.ok ? "✓" : "✗"} <span class="name">${esc(label)}</span>${esc(memo)}</div>`;
   } else if (event.type === "degraded") {
     html = `<div class="agent-line">△ ${esc(event.reason || "")}</div>`;
+  } else if (event.type === "notice") {
+    html = `<div class="agent-line">△ ${esc(event.message || "")}</div>`;
   }
   if (html) trace.insertAdjacentHTML("beforeend", html);
 }
@@ -356,11 +413,13 @@ function runAgentStream(params) {
     let settled = false;
     const done = () => { settled = true; source.close(); agentSource = null; };
 
-    ["step", "tool", "degraded"].forEach((name) => {
+    ["step", "tool", "degraded", "notice"].forEach((name) => {
       source.addEventListener(name, (e) => renderAgentEvent(JSON.parse(e.data)));
     });
+    source.addEventListener("session", (e) => setSessionId(JSON.parse(e.data).session_id));
     source.addEventListener("final", (e) => {
       const data = JSON.parse(e.data);
+      if (data.session_id) setSessionId(data.session_id);
       done();
       resolve(data);
     });
@@ -401,6 +460,7 @@ async function search() {
   $("status").classList.toggle("hidden", useAgent);
   try {
     const params = new URLSearchParams({ q, jd_channel: $("jdCh").value || "0", llm: $("useLlm").checked, risk: $("useRisk").checked });
+    if (useAgent && sessionId) params.set("session_id", sessionId);   // 带上会话 → 承接上文
     if (useAgent) {
       $("agent-out").innerHTML = agentPanelHTML();
       const data = await runAgentStream(params);
@@ -420,6 +480,10 @@ async function search() {
     $("status").classList.add("hidden");
   }
 }
+
+$("newSession").onclick = newSession;
+$("watchKeyword").onclick = watchKeyword;
+renderSessionState();   // 初始化会话状态行（sessionId 已在上面从 localStorage 读回）
 
 let lastData = null;
 const filters = { platform: "all", jdPremium: false, minRate: 0, minSales: 0, excludeSuspicious: false };

@@ -190,13 +190,69 @@ def report(connection: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
-def load_watchlist(path: Path = WATCHLIST_PATH) -> dict:
-    """读取关注清单；不存在时写入模板并返回。"""
+def load_watchlist(path: Path | None = None) -> dict:
+    """读取关注清单；不存在时写入模板并返回。
+
+    ⚠️ `path` 默认值在**调用时**解析（不用 `= WATCHLIST_PATH` 当默认参数）——
+    写成默认参数会在导入时绑定，测试打桩 `WATCHLIST_PATH` 就失效了。
+    同一个坑本项目在 `sources/retry.py` 的 `sleeper` 上已经踩过一次。
+    """
+    path = Path(path or WATCHLIST_PATH)
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(_DEFAULT_WATCHLIST, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"已创建关注清单模板：{path}（可编辑 keywords 后每日重跑）")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_watchlist(watchlist: dict, path: Path | None = None) -> None:
+    """写回关注清单。
+
+    与 `load_watchlist` 放在一起，免得读与写的默认值各在一处、日后改一个漏一个。
+    """
+    path = Path(path or WATCHLIST_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(watchlist, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _normalise_keywords(keywords: list[str]) -> list[str]:
+    """去空白、去重、保序（顺手丢掉空串）。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in keywords or []:
+        keyword = str(raw).strip()
+        if keyword and keyword not in seen:
+            seen.add(keyword)
+            result.append(keyword)
+    return result
+
+
+def add_watch_keyword(keyword: str, path: Path | None = None) -> tuple[list[str], bool]:
+    """加入关注清单。返回 (清单, 是否新增)——已存在时不重复添加。"""
+    keyword = str(keyword).strip()
+    if not keyword:
+        raise ValueError("关注关键词不能为空")
+    watchlist = load_watchlist(path)
+    keywords = _normalise_keywords(watchlist.get("keywords", []))
+    if keyword in keywords:
+        return keywords, False
+    keywords.append(keyword)
+    watchlist["keywords"] = keywords
+    save_watchlist(watchlist, path)
+    return keywords, True
+
+
+def remove_watch_keyword(keyword: str, path: Path | None = None) -> tuple[list[str], bool]:
+    """从关注清单移除。返回 (清单, 是否真的删掉了)。"""
+    keyword = str(keyword).strip()
+    watchlist = load_watchlist(path)
+    keywords = _normalise_keywords(watchlist.get("keywords", []))
+    if keyword not in keywords:
+        return keywords, False
+    keywords = [item for item in keywords if item != keyword]
+    watchlist["keywords"] = keywords
+    save_watchlist(watchlist, path)
+    return keywords, True
 
 
 def main(argv: list[str] | None = None) -> None:

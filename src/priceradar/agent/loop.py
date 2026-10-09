@@ -121,6 +121,9 @@ class AgentRun:
     result: PipelineResult | None = None       # 确定性比价结果（降级或复用而来）
     usage: Usage = field(default_factory=Usage)
     trace: Trace | None = None
+    # 本轮实际发出去的完整消息列表（含历史）。调试时能一眼看到模型究竟看到了什么；
+    # 多轮场景下调用方靠它把新产生的 assistant / tool 消息落库。
+    messages: list[dict] = field(default_factory=list)
 
     @property
     def degraded(self) -> bool:
@@ -248,6 +251,7 @@ def _degrade(
     usage: Usage,
     trace: Trace,
     compare_kwargs: dict,
+    messages: list[dict] | None = None,
 ) -> AgentRun:
     """降级：优先复用循环内已取得的比价结果，**绝不重跑**；一次都没有才真跑兜底。"""
     reason = _STOP_REASON.get(stopped_by, stopped_by)
@@ -265,6 +269,7 @@ def _degrade(
         result=result,
         usage=usage,
         trace=trace,
+        messages=messages or [],
     )
 
 
@@ -272,6 +277,7 @@ def run_agent(
     query: str,
     *,
     client: Any = None,
+    messages: list[dict] | None = None,
     on_event: Callable[[dict], None] | None = None,
     max_steps: int = MAX_STEPS,
     max_calls_per_step: int = MAX_CALLS_PER_STEP,
@@ -284,19 +290,26 @@ def run_agent(
 
     `client` 为 None 时按「未配置 LLM」处理；不传则尝试 `DeepSeekClient.from_env()`。
     `compare_kwargs` 透传给兜底的 `compare_prices`（如 jd_channel / use_risk）。
+
+    `messages` 用于**多轮**：由 `context.build_messages` 组装好（固定 system →
+    结构化槽位 → 最近若干完整轮 → 本轮提问）。不传则是单轮（system + query）。
+    传入的列表会被复制，循环只在副本上追加。
     """
     trace = trace or Trace()
     emit = _emitter(on_event)
-    if client is None:
-        client = _llm_client()
-    if client is None:
-        return _degrade(query, "llm_unavailable", memo={}, steps=[], usage=Usage(), trace=trace, compare_kwargs=compare_kwargs)
-
-    tool_schemas = openai_tools()
-    messages: list[dict] = [
+    messages = list(messages) if messages else [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": query},
     ]
+    if client is None:
+        client = _llm_client()
+    if client is None:
+        return _degrade(
+            query, "llm_unavailable", memo={}, steps=[], usage=Usage(), trace=trace,
+            compare_kwargs=compare_kwargs, messages=messages,
+        )
+
+    tool_schemas = openai_tools()
     memo: dict[tuple[str, str], ToolExecution] = {}
     steps: list[AgentStep] = []       # 只记**发生过工具调用**的轮次；最终答复不算一轮
     usage = Usage()
@@ -305,20 +318,20 @@ def run_agent(
     for index in range(max_steps):
         # 上下文预算按实际消息体积算（不做增量记账——那是最容易算错的地方）
         if len(json.dumps(messages, ensure_ascii=False, default=str)) > char_budget:
-            return _degrade(query, "budget", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs)
+            return _degrade(query, "budget", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
 
         with trace.span("llm_chat", f"第 {index + 1} 轮"):
             try:
                 reply = client.chat(messages, tools=tool_schemas, max_tokens=MAX_TOKENS)
             except LlmError as exc:
                 trace.count("llm_deepseek")
-                return _degrade(query, "llm_error", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs)
+                return _degrade(query, "llm_error", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
         trace.count("llm_deepseek")
         usage = _add(usage, reply.usage)
 
         if not reply.tool_calls:
             if executed_total == 0:
-                return _degrade(query, "no_tools", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs)
+                return _degrade(query, "no_tools", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
             # ⚠️ 这里**刻意不发终止事件**：事件词汇表按层分开——本循环只发"进度"
             # （step / tool），终止由调用方按返回值自己决定怎么表达。
             # 曾经在这里 emit 过一个 {"type":"final"}，结果与 SSE 层的真·final 撞名，
@@ -331,6 +344,7 @@ def run_agent(
                 result=_memoized_result(memo),
                 usage=usage,
                 trace=trace,
+                messages=messages,
             )
 
         emit({"type": "step", "index": index, "content": reply.content})
@@ -375,9 +389,9 @@ def run_agent(
 
         steps.append(step)
         if total_budget_exhausted:
-            return _degrade(query, "budget", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs)
+            return _degrade(query, "budget", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
 
-    return _degrade(query, "max_steps", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs)
+    return _degrade(query, "max_steps", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
 
 
 def render(run: AgentRun) -> str:
