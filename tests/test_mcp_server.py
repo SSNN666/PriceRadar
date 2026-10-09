@@ -30,15 +30,22 @@ def fake_result() -> PipelineResult:
 
 
 def offline(monkeypatch) -> None:
-    """禁用 LLM（走确定性兜底路径，避免测试触网）。"""
-    monkeypatch.setattr(server, "_llm_client", lambda: None)
+    """禁用 LLM（走确定性兜底路径，避免测试触网）。
+
+    打桩点已随「编排下沉」搬到 `agent.actions`——MCP 侧不再自己持有 LLM 客户端。
+    """
+    import priceradar.agent.actions as actions
+
+    monkeypatch.setattr(actions, "_llm_client", lambda: None)
 
 
 # ---------- compare_prices ----------
+# 打桩点从 `server.run`（管线）上移到 `server.action_compare_prices`（意图级能力）：
+# 编排现在与 Web / Agent 循环共用同一份实现，MCP 侧只负责渲染。
 
 def test_compare_text_renders_pipeline(monkeypatch):
     offline(monkeypatch)
-    monkeypatch.setattr(server, "run", lambda keyword, **kwargs: fake_result())
+    monkeypatch.setattr(server, "action_compare_prices", lambda query, **kwargs: fake_result())
     text = server._compare_text("QCY N20 降噪耳机", 0)
     assert "同款组" in text
     assert "到手价明细" in text
@@ -48,10 +55,10 @@ def test_compare_text_renders_pipeline(monkeypatch):
 def test_compare_text_handles_pdd_error(monkeypatch):
     offline(monkeypatch)
 
-    def boom(keyword, **kwargs):
+    def boom(query, **kwargs):
         raise server.PddApiError("50001 业务服务错误")
 
-    monkeypatch.setattr(server, "run", boom)
+    monkeypatch.setattr(server, "action_compare_prices", boom)
     text = server._compare_text("x", 0)
     assert "拼多多检索失败" in text
 
@@ -59,10 +66,10 @@ def test_compare_text_handles_pdd_error(monkeypatch):
 def test_compare_text_handles_empty_pool(monkeypatch):
     offline(monkeypatch)
 
-    def empty(keyword, **kwargs):
+    def empty(query, **kwargs):
         raise ValueError("关键词 'x' 无检索结果")
 
-    monkeypatch.setattr(server, "run", empty)
+    monkeypatch.setattr(server, "action_compare_prices", empty)
     assert server._compare_text("x", 0) == "关键词 'x' 无检索结果"
 
 
@@ -78,7 +85,7 @@ def test_risk_text_with_issues(monkeypatch):
         note="由 LLM 聚类",
         degraded=False,
     )
-    monkeypatch.setattr(server, "scan_with_env", lambda product: summary)
+    monkeypatch.setattr(server, "action_scan_risk", lambda product: summary)
     text = server._risk_text("QCY N20")
     assert "续航缩水" in text and "3 条提及" in text
     assert "不代表全部用户反馈" in text  # 覆盖声明固定输出
@@ -91,17 +98,45 @@ def test_risk_text_degraded_lists_items(monkeypatch):
         queries=["QCY N20 避雷"],
         items=[RiskItem(query="q", title="翻车实录", url="https://x.com/1", site_name="知乎", snippet="")],
     )
-    monkeypatch.setattr(server, "scan_with_env", lambda product: summary)
+    monkeypatch.setattr(server, "action_scan_risk", lambda product: summary)
     text = server._risk_text("QCY N20")
     assert "未做问题归类" in text
     assert "翻车实录" in text
+
+
+def test_compare_text_delegates_to_the_shared_action(monkeypatch):
+    """MCP 必须走与 Web / Agent 循环**同一份编排**。
+
+    此前 MCP 自己拼了一遍管线，漏掉了用户补录券与风险聚类——同一个「比价」
+    在两处给出不同结果。这条断言的就是那个接缝，防止日后再分叉。
+    """
+    offline(monkeypatch)
+    seen = {}
+
+    def spy(query, **kwargs):
+        seen.update({"query": query, **kwargs})
+        return fake_result()
+
+    monkeypatch.setattr(server, "action_compare_prices", spy)
+    server._compare_text("QCY N20", 24)
+    assert seen["query"] == "QCY N20"
+    assert seen["jd_channel"] == 24
+
+
+def test_risk_text_delegates_to_the_shared_action(monkeypatch):
+    offline(monkeypatch)
+    summary = RiskSummary(product="x", queries=["q"], items=[], note="ok", degraded=True)
+    seen = []
+    monkeypatch.setattr(server, "action_scan_risk", lambda product: seen.append(product) or summary)
+    server._risk_text("QCY N20")
+    assert seen == ["QCY N20"]
 
 
 def test_risk_text_handles_bocha_error(monkeypatch):
     def boom(product):
         raise BochaError("HTTP 403: no quota")
 
-    monkeypatch.setattr(server, "scan_with_env", boom)
+    monkeypatch.setattr(server, "action_scan_risk", boom)
     assert "风险扫描失败" in server._risk_text("x")
 
 
