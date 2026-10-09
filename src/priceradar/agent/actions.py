@@ -333,9 +333,16 @@ def summarize_history(result: PriceHistory) -> str:
 # ============================================================
 
 class ComparePricesArgs(BaseModel):
+    """比价工具的参数。
+
+    ⚠️ **刻意不含 `use_risk`**：风险扫描另有 `scan_risk` 工具。若两者都能触发，
+    实测中模型会把 `use_risk=true` 与 `scan_risk` **同时**调一遍，白跑一次检索
+    （约 ¥0.2 与 4 次搜索调用）。重叠的能力不能同时暴露给模型。
+    `compare_prices()` 函数本身仍保留 `use_risk`，供 Web API 的 `risk` 开关使用。
+    """
+
     query: str = Field(description="用户的查询，原文照传：关键词（如「QCY N20 降噪耳机」）或自然语言整句；也可以是拼多多商品链接")
     jd_channel: int = Field(default=0, description="京东京粉频道：0=自动品类路由（默认），-1=关闭京东侧，>0=定点拉该频道号")
-    use_risk: bool = Field(default=False, description="是否额外做全网风险扫描（多花约 ¥0.2 与 5-10 秒）")
 
 
 class FindSimilarArgs(BaseModel):
