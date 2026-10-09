@@ -1,6 +1,6 @@
 # 开工清单（Next Steps）
 
-> 更新：2026-10-09 ｜ 状态：M0 收官 + M1 核心件已交付 + **M2 Agent 化 ①~⑦ 全部完成**，**478 个测试全绿**，分支 `feat/agent-loop`
+> 更新：2026-10-09 ｜ 状态：M0 收官 + M1 核心件已交付 + **M2 Agent 化 ①~⑧ 全部完成**，**496 个测试全绿**，分支 `feat/agent-loop`
 > 用法：每天从「⏰ 每日第一件事」开始；本文件随手更新，是所有待办的唯一来源。
 
 > 🆕 **2026-10-08 制定 / 10-09 执行：[Agent 化改造计划](./agent-upgrade-plan.md)**（M2 主线）
@@ -78,7 +78,7 @@
 
 执行顺序（按简历价值 / 单位工作量，**不要打乱**）：
 
-**①~⑦ 全部完成（2026-10-09，7 个 commit，测试 300 → 478）**
+**①~⑧ 全部完成（2026-10-09，9 个 commit，测试 300 → 496）**
 
 - [x] **① actions 工具层**（`2611650`）——新建 `agent/actions.py`（4 个意图级工具 + pydantic 入参 + 定长摘要）；`execute_similar` 核心与 `merge_user_coupons` 下沉；服务层改薄委托（签名一字未动，测试打桩点不受影响）；删掉 `tools.py` 的死注册表 `TOOLS`
 - [x] **② Agent 循环**（`5850531`）——`llm.chat()`（`complete` 原样保留）+ `loop.py`；按工具定的重试策略（**pdd 系 retry=none**，客户端内部已重试 3 次；bocha retry=once）；结果 memo；截断补齐 tool 消息；降级复用不重跑
@@ -88,7 +88,12 @@
 - [x] **⑥ 多轮会话 + 关注清单接口**（`9172209`）——`session_store.py`（seq 单调 / turn_id 显式 / **只允许整轮丢弃**）+ `context.py`（固定前缀在前，吃 prompt 缓存；槽位只取工具返回过的事实）。顺带补上 PRD §4.2 承诺却无落点的「帮我盯着降价」（`GET/POST/DELETE /api/watchlist`）。**真实两轮验证**：第 2 轮只问「那有没有什么踩坑的」，Agent 正确调 `scan_risk`、知道说的是 QCY N20、还复述了上一轮结论
 - [x] **⑦ 向量层测量**（`a2391f2`）——**结论：不进判定路径**。纯向量最优 70.2% vs 规则 100%；换型号负例余弦（最高 0.96）**高于**堆促销词的真同款（最低 0.91），分布重叠。已加护栏测试钉住 matcher 源码。⚠️ 叙事冲突未解：PRD/简历策略承诺 **bge 本地**，本次测量用的是 DashScope API
 
-> **⑧ 待办（⑦ 的尾巴）**：`channel_type=3` 推荐集去噪的 precision@k 测量
+> **⑧ 已完成（`8654c00`）**：真实 token 计量与成本——此前 loop 算出了 Usage 却从没推进
+> Trace、SSE 端点根本没建 trace。补上后实测单次两轮查询 **￥0.0016**（旧按次估算高估 2.5 倍）、
+> **缓存命中率 87%**。顺带修掉一个显示 bug（按小数位截断会把 ￥0.00004 显示成 0.0000）。
+> README 已全面重写（此前还写着「147 绿」且完全没提 Agent 能力）。
+
+> **⑨ 待办（⑦ 的尾巴）**：`channel_type=3` 推荐集去噪的 precision@k 测量
 > （现精度 33-47%，是**唯一有可能**体现向量价值的地方）。需要人工盲标推荐集，
 > 工具链可复用 `evaluation/label_tool.py`。
 
@@ -150,7 +155,7 @@ Cursor / Claude Desktop 在 mcpServers JSON 里加（详见 `src/priceradar/mcp_
 ## 🧭 常用命令速查
 
 ```bash
-python -m pytest -q                                              # 测试（478 绿）
+python -m pytest -q                                              # 测试（496 绿）
 python -m priceradar.agent.loop "帮我看看QCY N20哪里买划算，顺便有没有踩坑的"   # 🆕 Agent 循环：LLM 自主决定调哪些工具
 python -m priceradar.agent.pipeline "帮我看看QCY N20哪里买划算"    # 固定管线 CLI（--risk 加风险扫描；--jd-channel 0=自动路由(默认) / -1=关闭京东侧）
 python -m evaluation.agent_eval                                  # 🆕 Agent 行为评测（离线回放录制，零花费）
