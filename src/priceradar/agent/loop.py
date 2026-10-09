@@ -168,6 +168,13 @@ def _assistant_message(reply: ChatReply) -> dict:
 def _emitter(on_event: Callable[[dict], None] | None) -> Callable[[dict], None]:
     """事件外发：**一套机制两个消费者**（SSE 转发前端 / 测试收集断言）。
 
+    词汇表（本层只发**进度**，不发终止）：
+    - `{"type": "step", "index": n, "content": str|None}` —— 某一轮模型给出了工具调用
+    - `{"type": "tool", ...}` —— 单个工具执行完毕（含 ok / summary / from_memo）
+
+    终止信息在 `AgentRun` 的返回值里；由调用方决定怎么表达（SSE 层用 `final`）。
+    **不要在这里新增 `final` / `error` 这类名字**——会与传输层撞车。
+
     回调失败必须吞掉——前端断连时回调会抛异常，绝不能因此中断 Agent 运行。
     """
     if on_event is None:
@@ -312,7 +319,10 @@ def run_agent(
         if not reply.tool_calls:
             if executed_total == 0:
                 return _degrade(query, "no_tools", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs)
-            emit({"type": "final", "stopped_by": "finish", "text": (reply.content or "").strip()})
+            # ⚠️ 这里**刻意不发终止事件**：事件词汇表按层分开——本循环只发"进度"
+            # （step / tool），终止由调用方按返回值自己决定怎么表达。
+            # 曾经在这里 emit 过一个 {"type":"final"}，结果与 SSE 层的真·final 撞名，
+            # 前端收到第一个（没有 payload）就 close 了，比价卡片永远出不来。
             return AgentRun(
                 query=query,
                 stopped_by="finish",

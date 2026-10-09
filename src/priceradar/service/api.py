@@ -10,16 +10,20 @@ LLM 默认启用（有 key 时），失败自动确定性兜底。
 
 from __future__ import annotations
 
+import json
 import threading
 import urllib.error
 from datetime import date
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Iterator
 
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from priceradar.agent import actions
 from priceradar.agent.actions import compare_prices
+from priceradar.agent.loop import run_agent
 from priceradar.agent.pipeline import PipelineResult
 from priceradar.domain.models import CERTIFIED_SHOP_KINDS, SHOP_KIND_LABELS, Offer
 from priceradar.engine.pricing import PriceBreakdown
@@ -224,6 +228,136 @@ def execute_similar(goods_sign: str, limit: int = 20) -> dict:
         "offers": [offer_payload(offer, breakdown, group_count=1) for offer, breakdown in result.breakdowns],
         "notes": result.notes,
     }
+
+
+# 本层独占的事件名（上游误发同名事件会被丢弃，见 `execute_agent`）
+_TRANSPORT_EVENTS = frozenset({"final", "error"})
+
+
+def _sse(event: dict, *, event_id: int | None = None) -> str:
+    """一个 SSE 帧。`id:` 用于断线重连时的 Last-Event-ID 回放。"""
+    lines = []
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"event: {event['type']}")
+    lines.append(f"data: {json.dumps(event, ensure_ascii=False)}")
+    return "\n".join(lines) + "\n\n"
+
+
+def execute_agent(
+    query: str,
+    jd_channel: int = 0,
+    use_llm: bool = True,
+    use_risk: bool = False,
+    *,
+    heartbeat: float = 15.0,
+) -> Iterator[str]:
+    """Agent 循环 → SSE 帧的**同步生成器**。
+
+    为什么用同步生成器：内部全是阻塞的 urllib 调用。Starlette 的
+    `StreamingResponse` 对非 async 迭代器会走 `iterate_in_threadpool`（不阻塞事件
+    循环），而 async 生成器里做阻塞调用会卡死整个进程。
+
+    为什么把 Agent 放进**后台线程 + 队列**：`on_event` 是在循环内部同步调用的，
+    没法从回调里 yield。用队列把两侧解耦，事件才能真正**边跑边发**——
+    用户在工具还在执行时就能看到进度，而不是等全部跑完一次性涌出来。
+
+    断连处理（诚实版）：Starlette 的 `iterate_in_threadpool` **不会** close 底层
+    迭代器（已读源码确认），所以生成器的 `finally` 不会被及时执行，取消逻辑不能
+    建在它上面。这里的取舍是：断连后这次运行照常跑完（会话/结果不丢），
+    代价是一次白跑。真要取消得靠 on_event 里检查连接状态，暂不做。
+    """
+    if not use_llm:
+        yield _sse({"type": "degraded", "reason": "已关闭 LLM，走确定性比价"}, event_id=0)
+        yield _sse(_final_event(query, jd_channel, use_risk, llm_client=None), event_id=1)
+        return
+
+    events: Queue[dict] = Queue()
+
+    def worker() -> None:
+        try:
+            run = run_agent(query, on_event=events.put, jd_channel=jd_channel, use_risk=use_risk)
+            events.put({"type": "__done", "run": run})
+        except Exception as exc:  # 首个 chunk 之后异常处理器已失效，必须自己转成事件
+            events.put({"type": "__error", "message": f"{type(exc).__name__}: {exc}"})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    counter = 0
+    while True:
+        try:
+            event = events.get(timeout=heartbeat)
+        except Empty:
+            yield ": ping\n\n"  # SSE 注释行做心跳，防代理按空闲超时切断
+            continue
+        if event["type"] == "__done":
+            run = event["run"]
+            counter += 1
+            yield _sse(_agent_result_event(run, jd_channel, use_risk), event_id=counter)
+            return
+        if event["type"] == "__error":
+            counter += 1
+            yield _sse({"type": "error", "message": event["message"]}, event_id=counter)
+            return
+        if event.get("type") in _TRANSPORT_EVENTS:
+            # 本层**独占** final / error：上游（或日后新增的节点）误发同名事件一律丢弃。
+            # 起因：loop 曾自己 emit 一个 {"type":"final"}（只有 text、没有 payload），
+            # 前端收到就先 close 了，真正的 final 再也到不了，比价卡片永远出不来。
+            continue
+        counter += 1
+        yield _sse(event, event_id=counter)
+
+
+def _agent_result_event(run, jd_channel: int, use_risk: bool) -> dict:
+    """终帧：既有前端 payload + Agent 自己的元信息。"""
+    payload = to_payload(run.result) if run.result is not None else None
+    return {
+        "type": "final",
+        "stopped_by": run.stopped_by,
+        "degraded": run.degraded,
+        "final_text": run.final_text,
+        "tools": [execution.name for step in run.steps for execution in step.tool_calls],
+        "rounds": len(run.steps),
+        "usage": {
+            "prompt_tokens": run.usage.prompt_tokens,
+            "completion_tokens": run.usage.completion_tokens,
+            "cache_hit_rate": round(run.usage.cache_hit_rate, 4),
+        },
+        "payload": payload,
+    }
+
+
+def _final_event(query: str, jd_channel: int, use_risk: bool, *, llm_client) -> dict:
+    """不走 Agent 的直通终帧（`llm=false` 时）。"""
+    result = compare_prices(query, jd_channel=jd_channel, use_risk=use_risk, llm_client=llm_client)
+    return {
+        "type": "final",
+        "stopped_by": "llm_disabled",
+        "degraded": True,
+        "final_text": result.summary or "",
+        "tools": [],
+        "rounds": 0,
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "cache_hit_rate": 0.0},
+        "payload": to_payload(result),
+    }
+
+
+@app.get("/api/agent/stream")
+def api_agent_stream(
+    q: str = Query(..., min_length=1, description="自然语言或关键词"),
+    jd_channel: int = 0,
+    llm: bool = True,
+    risk: bool = False,
+) -> StreamingResponse:
+    """Agent 流式查询：边跑边推工具进度，最后给完整 payload。
+
+    响应头三件套（部署到 nginx 时缺 `X-Accel-Buffering: no` 流会被缓冲成一坨）。
+    """
+    return StreamingResponse(
+        execute_agent(q, jd_channel=jd_channel, use_llm=llm, use_risk=risk),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 def execute_snapshot() -> dict:

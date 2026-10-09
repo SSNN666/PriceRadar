@@ -68,6 +68,18 @@
   .decision.d-watch .dtier { background:#fff4e0; color:var(--warn); }
   .decision.d-discourage .dtier { background:#fdecec; color:#c02b2b; }
   .dhead { font-size:15px; font-weight:600; }
+  /* Agent 面板：实时显示「正在调什么工具」，与 #out 分开——render() 会整块覆盖 #out，
+     往里面追加内容和它打架 */
+  .agent { border-left:4px solid var(--accent); }
+  .agent-line { margin:7px 0; font-size:13px; }
+  .agent-round { display:inline-block; font-size:11px; color:#fff; background:var(--accent); border-radius:999px; padding:1px 8px; margin-right:6px; }
+  .agent-tool { font-size:12px; padding:2px 0 2px 20px; color:var(--sub); }
+  .agent-tool.ok { color:var(--good); }
+  .agent-tool.bad { color:#c02b2b; }
+  .agent-tool .name { font-weight:600; }
+  .agent-answer { margin-top:12px; padding-top:12px; border-top:1px solid #eef1f5; }
+  .agent-meta { color:var(--sub); font-size:12px; }
+  .agent-text { white-space:pre-wrap; font-size:14px; margin-top:6px; }
 </style>
 </head>
 <body>
@@ -81,9 +93,10 @@
   </div>
   <div class="hint" id="qHint">粘贴拼多多链接可直接反查到那件商品，并自动扩展相似商品 —— <b>请原样粘贴</b>，手工删改参数（如 uin）会导致平台拒绝。</div>
   <div class="opts">
+    <label title="由 LLM 自主决定调用哪些工具，并把每一步实时推给页面。关闭则走固定管线。"><input id="useAgent" type="checkbox" checked> Agent 模式（自主调工具 + 实时进度）</label>
     <label><input id="useLlm" type="checkbox" checked> LLM 理解与总结</label>
     <label title="0=自动按品类选频道；-1=关闭京东侧">京东频道 <input id="jdCh" type="number" value="0" style="width:44px"></label>
-    <label><input id="useRisk" type="checkbox"> 风险扫描（约 ¥0.2/次）</label>
+    <label title="Agent 模式下由它自己判断要不要扫风险；这里只影响非 Agent 模式"><input id="useRisk" type="checkbox"> 风险扫描（约 ¥0.2/次）</label>
   </div>
   <div class="toolbar">
     <button id="snap" class="ghost" title="按关注清单（data/watchlist.json）采集当日到手价；同日重复自动幂等跳过">采集今日快照</button>
@@ -98,6 +111,7 @@
   <div id="vision-out"></div>
   <div id="status" class="loading hidden">查询中（约 3-10 秒）…</div>
   <div id="error" class="error hidden"></div>
+  <div id="agent-out"></div>
   <div id="out" class="hidden"></div>
   <div id="similar-out"></div>
 </div>
@@ -304,19 +318,100 @@ function sparkline(series) {
   return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="vertical-align:middle"><polyline points="${pts}" fill="none" stroke="#0a6cff" stroke-width="1.6"/></svg>`;
 }
 
+// —— Agent 模式：SSE 实时进度 ——
+// 面板挂在 #agent-out（**不是 #out**）：render() 会整块覆盖 #out 的 innerHTML，
+// 往里面追加进度会和它打架。沿用 #vision-out / #similar-out 的既有先例。
+const TOOL_LABELS = { compare_prices: "跨平台比价", find_similar: "找相似商品", scan_risk: "风险扫描", check_price_history: "价格观测" };
+let agentSource = null;
+
+function agentPanelHTML() {
+  return `<div class="card agent"><b>Agent 正在工作…</b><div id="agentTrace"></div>
+    <div id="agentAnswer" class="agent-answer hidden"></div></div>`;
+}
+
+function renderAgentEvent(event) {
+  const trace = $("agentTrace");
+  if (!trace) return;
+  let html = "";
+  if (event.type === "step") {
+    html = `<div class="agent-line"><span class="agent-round">第 ${event.index + 1} 轮</span>${esc(event.content || "")}</div>`;
+  } else if (event.type === "tool") {
+    const label = TOOL_LABELS[event.name] || event.name;
+    const memo = event.from_memo ? "（复用本次结果，未重复调用）" : "";
+    html = `<div class="agent-tool ${event.ok ? "ok" : "bad"}">${event.ok ? "✓" : "✗"} <span class="name">${esc(label)}</span>${esc(memo)}</div>`;
+  } else if (event.type === "degraded") {
+    html = `<div class="agent-line">△ ${esc(event.reason || "")}</div>`;
+  }
+  if (html) trace.insertAdjacentHTML("beforeend", html);
+}
+
+// ⚠️ EventSource 在**服务端正常关流**后也会当成"断线"，约 3 秒后自动重发同一个 GET
+// ——同一次查询会完整跑第二遍（拼多多账号限流是已知事故）。所以收到 final / error
+// 必须显式 close()。连接层 error 事件没有 data、业务错误事件有，用这个区分。
+function runAgentStream(params) {
+  return new Promise((resolve, reject) => {
+    if (agentSource) { agentSource.close(); agentSource = null; }
+    const source = new EventSource("/api/agent/stream?" + params);
+    agentSource = source;
+    let settled = false;
+    const done = () => { settled = true; source.close(); agentSource = null; };
+
+    ["step", "tool", "degraded"].forEach((name) => {
+      source.addEventListener(name, (e) => renderAgentEvent(JSON.parse(e.data)));
+    });
+    source.addEventListener("final", (e) => {
+      const data = JSON.parse(e.data);
+      done();
+      resolve(data);
+    });
+    source.addEventListener("error", (e) => {
+      if (settled) return;
+      done();
+      let message = "与服务端的连接中断（未收到最终结果）";
+      if (e.data) {
+        try { message = JSON.parse(e.data).message || message; } catch { /* 保持默认文案 */ }
+      }
+      reject(new Error(message));
+    });
+  });
+}
+
+function renderAgentAnswer(data) {
+  const box = $("agentAnswer");
+  if (!box) return;
+  const tools = (data.tools || []).length
+    ? data.tools.map((n) => TOOL_LABELS[n] || n).join(" → ")
+    : "（未调用工具）";
+  const bits = [`${data.rounds} 轮`, tools];
+  if (data.degraded) bits.push(`⚠️ 已降级：${data.stopped_by}`);
+  box.innerHTML = `<div class="agent-meta">${esc(bits.join(" · "))}</div>
+    <div class="agent-text">${esc(data.final_text || "（模型未给出文字答复）")}</div>`;
+  box.classList.remove("hidden");
+}
+
 async function search() {
   const q = $("q").value.trim();
   if (!q) return;
+  const useAgent = $("useAgent").checked;
   $("go").disabled = true;
-  $("status").classList.remove("hidden");
   $("error").classList.add("hidden");
   $("out").classList.add("hidden");
+  $("agent-out").innerHTML = "";
+  // Agent 模式下面板自己就是进度指示，不再叠一行"查询中"
+  $("status").classList.toggle("hidden", useAgent);
   try {
     const params = new URLSearchParams({ q, jd_channel: $("jdCh").value || "0", llm: $("useLlm").checked, risk: $("useRisk").checked });
-    const resp = await fetch("/api/search?" + params);
-    const data = await readJson(resp);
-    if (!resp.ok) throw new Error(data.detail || "查询失败");
-    render(data);
+    if (useAgent) {
+      $("agent-out").innerHTML = agentPanelHTML();
+      const data = await runAgentStream(params);
+      renderAgentAnswer(data);
+      if (data.payload) render(data.payload);
+    } else {
+      const resp = await fetch("/api/search?" + params);
+      const data = await readJson(resp);
+      if (!resp.ok) throw new Error(data.detail || "查询失败");
+      render(data);
+    }
   } catch (err) {
     $("error").textContent = "出错了：" + err.message;
     $("error").classList.remove("hidden");

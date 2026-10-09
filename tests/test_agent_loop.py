@@ -405,11 +405,24 @@ def test_events_are_emitted_in_order(monkeypatch):
     kinds = [event["type"] for event in events]
     assert kinds[0] == "step"
     assert "tool" in kinds
-    assert kinds[-1] == "final"
     tool_event = next(event for event in events if event["type"] == "tool")
     assert tool_event["name"] == "compare_prices"
     assert tool_event["ok"] is True
     assert tool_event["summary"] == "比价摘要"
+
+
+def test_loop_never_emits_transport_level_event_names(monkeypatch):
+    """本层只发**进度**事件。`final` / `error` 属于传输层（SSE）。
+
+    曾经这里 emit 过一个 {"type":"final"}，与 SSE 层的真·final 撞名——
+    前端收到第一个（没有 payload）就把连接关了，比价卡片永远出不来。
+    这个坑只在真实端到端跑的时候才暴露，单测当时全绿。
+    """
+    patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    transport, client = make_agent(monkeypatch, call_tool("c1", "compare_prices", query="x"), answer("好"))
+    events: list[dict] = []
+    loop.run_agent("x", client=client, on_event=events.append)
+    assert {event["type"] for event in events} <= {"step", "tool"}
 
 
 def test_event_callback_failure_does_not_break_the_run(monkeypatch):
