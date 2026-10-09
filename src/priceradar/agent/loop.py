@@ -142,13 +142,19 @@ def _canonical(arguments: dict) -> str:
     return json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
 
 
-def _add(left: Usage, right: Usage) -> Usage:
+def _usage_of(trace: Trace) -> Usage:
+    """`AgentRun.usage` 是 `trace.tokens` 的**视图**，不是第二个累加器。
+
+    两处各累加一遍同样的数字迟早会漂（而且没人会发现）。trace 已经是这份数据的
+    唯一持久化去处，那就让它当唯一来源。
+    """
+    tokens = trace.tokens
     return Usage(
-        prompt_tokens=left.prompt_tokens + right.prompt_tokens,
-        completion_tokens=left.completion_tokens + right.completion_tokens,
-        total_tokens=left.total_tokens + right.total_tokens,
-        cache_hit_tokens=left.cache_hit_tokens + right.cache_hit_tokens,
-        cache_miss_tokens=left.cache_miss_tokens + right.cache_miss_tokens,
+        prompt_tokens=tokens.prompt,
+        completion_tokens=tokens.completion,
+        total_tokens=tokens.prompt + tokens.completion,
+        cache_hit_tokens=tokens.cache_hit,
+        cache_miss_tokens=tokens.cache_miss,
     )
 
 
@@ -248,7 +254,6 @@ def _degrade(
     *,
     memo: dict,
     steps: list[AgentStep],
-    usage: Usage,
     trace: Trace,
     compare_kwargs: dict,
     messages: list[dict] | None = None,
@@ -267,7 +272,7 @@ def _degrade(
         final_text=result.summary or "",
         steps=steps,
         result=result,
-        usage=usage,
+        usage=_usage_of(trace),
         trace=trace,
         messages=messages or [],
     )
@@ -305,33 +310,39 @@ def run_agent(
         client = _llm_client()
     if client is None:
         return _degrade(
-            query, "llm_unavailable", memo={}, steps=[], usage=Usage(), trace=trace,
+            query, "llm_unavailable", memo={}, steps=[], trace=trace,
             compare_kwargs=compare_kwargs, messages=messages,
         )
 
     tool_schemas = openai_tools()
     memo: dict[tuple[str, str], ToolExecution] = {}
     steps: list[AgentStep] = []       # 只记**发生过工具调用**的轮次；最终答复不算一轮
-    usage = Usage()
     executed_total = 0
 
     for index in range(max_steps):
         # 上下文预算按实际消息体积算（不做增量记账——那是最容易算错的地方）
         if len(json.dumps(messages, ensure_ascii=False, default=str)) > char_budget:
-            return _degrade(query, "budget", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
+            return _degrade(query, "budget", memo=memo, steps=steps, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
 
         with trace.span("llm_chat", f"第 {index + 1} 轮"):
             try:
                 reply = client.chat(messages, tools=tool_schemas, max_tokens=MAX_TOKENS)
             except LlmError as exc:
                 trace.count("llm_deepseek")
-                return _degrade(query, "llm_error", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
+                return _degrade(query, "llm_error", memo=memo, steps=steps, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
         trace.count("llm_deepseek")
-        usage = _add(usage, reply.usage)
+        # 真实 token 计量入 trace（缓存命中/未命中分项）——这是成本的大头，
+        # 也是「固定前缀前置」这套设计唯一能被验证的地方
+        trace.record_usage(
+            prompt=reply.usage.prompt_tokens,
+            completion=reply.usage.completion_tokens,
+            cache_hit=reply.usage.cache_hit_tokens,
+            cache_miss=reply.usage.cache_miss_tokens,
+        )
 
         if not reply.tool_calls:
             if executed_total == 0:
-                return _degrade(query, "no_tools", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
+                return _degrade(query, "no_tools", memo=memo, steps=steps, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
             # ⚠️ 这里**刻意不发终止事件**：事件词汇表按层分开——本循环只发"进度"
             # （step / tool），终止由调用方按返回值自己决定怎么表达。
             # 曾经在这里 emit 过一个 {"type":"final"}，结果与 SSE 层的真·final 撞名，
@@ -342,7 +353,7 @@ def run_agent(
                 final_text=(reply.content or "").strip(),
                 steps=steps,
                 result=_memoized_result(memo),
-                usage=usage,
+                usage=_usage_of(trace),
                 trace=trace,
                 messages=messages,
             )
@@ -389,9 +400,9 @@ def run_agent(
 
         steps.append(step)
         if total_budget_exhausted:
-            return _degrade(query, "budget", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
+            return _degrade(query, "budget", memo=memo, steps=steps, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
 
-    return _degrade(query, "max_steps", memo=memo, steps=steps, usage=usage, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
+    return _degrade(query, "max_steps", memo=memo, steps=steps, trace=trace, compare_kwargs=compare_kwargs, messages=messages)
 
 
 def render(run: AgentRun) -> str:
@@ -423,13 +434,9 @@ def render(run: AgentRun) -> str:
         lines.append("")
         lines.append(render_pipeline(run.result))
     if run.trace is not None:
+        # summary_line 已含 token 分项、缓存命中率与成本——不另起一行重复一遍
         lines.append("")
         lines.append(run.trace.summary_line())
-        lines.append(
-            f"[token] 提示 {run.usage.prompt_tokens} ｜ 生成 {run.usage.completion_tokens}"
-            f" ｜ 缓存命中 {run.usage.cache_hit_tokens}"
-            f"（命中率 {run.usage.cache_hit_rate:.0%}）"
-        )
     return "\n".join(lines)
 
 

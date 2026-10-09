@@ -32,6 +32,7 @@ from priceradar.formatting import fmt_amount
 from priceradar.insights import assess_quality, campaign_context, decide, price_drops
 from priceradar.report import PLATFORM_LABELS, REASON_LABELS
 from priceradar.sources.pdd import PddApiError
+from priceradar.trace import Trace
 from priceradar.vision import CouponExtraction, to_offer_coupons
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -283,6 +284,26 @@ def _prepare_session(query: str, session_id: str | None) -> tuple[str, int, list
         connection.close()
 
 
+# Agent trace 落盘位置（None = 仓库内 data/traces/agent.jsonl，gitignored）。
+# 留成模块常量是为了让测试能注入临时路径——调用时才解析，不在导入时绑定。
+AGENT_TRACE_PATH: Path | None = None
+
+
+def _persist_trace(trace: Trace, path: Path | None = None) -> None:
+    """把本轮 Agent 的 trace 追加落盘。
+
+    此前 Agent 路径**根本没建 trace**——算出来的 token 计量全丢了。
+    落盘失败不影响结果（埋点不该拖垮主流程）。
+    """
+    from priceradar.config import project_root
+
+    target = path or AGENT_TRACE_PATH or (project_root() / "data" / "traces" / "agent.jsonl")
+    try:
+        trace.append_jsonl(target)
+    except OSError:
+        pass
+
+
 def _persist_turn(session_id: str, turn_id: int, run, initial_messages: list[dict]) -> None:
     """把本轮新产生的 assistant / tool 消息与更新后的槽位落库。
 
@@ -359,6 +380,7 @@ def execute_agent(
         prelude.append({"type": "notice", "message": trim_note})
 
     def worker() -> None:
+        trace = Trace()
         try:
             run = run_agent(
                 query,
@@ -366,6 +388,7 @@ def execute_agent(
                 on_event=events.put,
                 jd_channel=jd_channel,
                 use_risk=use_risk,
+                trace=trace,
             )
         except Exception as exc:  # 首个 chunk 之后异常处理器已失效，必须自己转成事件
             events.put({"type": "__error", "message": f"{type(exc).__name__}: {exc}"})
@@ -374,6 +397,7 @@ def execute_agent(
             _persist_turn(sid, turn_id, run, messages)
         except Exception as exc:  # 落库失败不能吞掉已经拿到的结果，如实提示
             events.put({"type": "notice", "message": f"本轮对话未能存入会话（不影响结果）：{exc}"})
+        _persist_trace(trace)
         events.put({"type": "__done", "run": run})
 
     threading.Thread(target=worker, daemon=True).start()
@@ -408,8 +432,9 @@ def execute_agent(
 
 
 def _agent_result_event(run, jd_channel: int, use_risk: bool, *, session_id: str = "") -> dict:
-    """终帧：既有前端 payload + Agent 自己的元信息。"""
+    """终帧：既有前端 payload + Agent 自己的元信息（含真实 token 计量与成本）。"""
     payload = to_payload(run.result) if run.result is not None else None
+    trace = run.trace
     return {
         "type": "final",
         "stopped_by": run.stopped_by,
@@ -421,7 +446,12 @@ def _agent_result_event(run, jd_channel: int, use_risk: bool, *, session_id: str
         "usage": {
             "prompt_tokens": run.usage.prompt_tokens,
             "completion_tokens": run.usage.completion_tokens,
+            "cache_hit_tokens": run.usage.cache_hit_tokens,
+            "cache_miss_tokens": run.usage.cache_miss_tokens,
             "cache_hit_rate": round(run.usage.cache_hit_rate, 4),
+            # 成本：有 token 就是真实单价算的；没有则回退到按次粗估（如实标注）
+            "cost": str(trace.est_cost) if trace is not None else "0",
+            "cost_is_estimated": bool(trace.llm_cost_is_estimate) if trace is not None else True,
         },
         "payload": payload,
     }

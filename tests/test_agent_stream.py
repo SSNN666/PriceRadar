@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 import priceradar.agent.session_store as session_store
 import priceradar.service.api as api_module
-from priceradar.agent.loop import AgentRun, AgentStep, ToolExecution
+from priceradar.agent.loop import AgentRun, AgentStep, ToolExecution, _usage_of
 from priceradar.agent.pipeline import ConfirmedItem, OfferGroup, PipelineResult
 from priceradar.domain.models import Offer, Platform
 from priceradar.engine.pricing import compute_price
@@ -254,15 +254,59 @@ def test_missing_query_is_rejected():
 # ============================================================
 
 def capture_runner(monkeypatch, run=None):
-    """记录 runner 收到的 kwargs（尤其是 messages），返回该列表。"""
+    """记录 runner 收到的 kwargs（尤其是 messages 与 trace），返回该列表。"""
     seen: list[dict] = []
 
     def fake(query, on_event=None, **kwargs):
+        produced = run if run is not None else make_run()
+        trace = kwargs.get("trace")
+        if trace is not None:      # 模拟真实循环：token 计量推进 trace，
+            trace.count("llm_deepseek", 2)
+            trace.record_usage(prompt=1263, completion=208, cache_hit=1024, cache_miss=239)
+            # 且 run.usage 是 trace 的视图（与 run_agent 的做法一致，避免两处漂移）
+            produced.trace = trace
+            produced.usage = _usage_of(trace)
         seen.append({"query": query, **kwargs})
-        return run if run is not None else make_run()
+        return produced
 
     monkeypatch.setattr(api_module, "run_agent", fake)
     return seen
+
+
+def test_trace_is_persisted_for_agent_runs(monkeypatch, tmp_path):
+    """Agent 路径必须落 trace——此前根本没建，算出来的 token 全丢了。"""
+    trace_file = tmp_path / "agent.jsonl"
+    monkeypatch.setattr(api_module, "AGENT_TRACE_PATH", trace_file)
+    capture_runner(monkeypatch, make_run())
+
+    TestClient(api_module.app).get("/api/agent/stream", params={"q": "QCY N20"})
+
+    lines = trace_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["tokens"]["cache_hit"] == 1024
+    assert payload["tokens"]["completion"] == 208
+    assert payload["cache_hit_rate"] == pytest.approx(0.8108, abs=1e-3)
+    assert payload["llm_cost_is_estimate"] is False
+
+
+def test_trace_write_failure_does_not_break_the_stream(monkeypatch, tmp_path):
+    """埋点落盘失败不该拖垮主流程。"""
+    monkeypatch.setattr(api_module, "AGENT_TRACE_PATH", tmp_path)   # 目录当文件写 → OSError
+    capture_runner(monkeypatch, make_run())
+    events = frames(TestClient(api_module.app).get("/api/agent/stream", params={"q": "x"}).text)
+    assert events[-1]["type"] == "final"
+
+
+def test_final_event_reports_real_cost(monkeypatch):
+    capture_runner(monkeypatch, make_run())
+    final = frames(TestClient(api_module.app).get("/api/agent/stream", params={"q": "x"}).text)[-1]
+    usage = final["usage"]
+    assert usage["cache_hit_tokens"] == 1024
+    assert usage["cache_miss_tokens"] == 239
+    assert usage["cache_hit_rate"] == pytest.approx(0.8108, abs=1e-3)
+    assert usage["cost_is_estimated"] is False
+    assert usage["cost"] != "0"          # 别把成本显示成零
 
 
 def test_first_turn_creates_a_session_and_persists_the_turn(monkeypatch):

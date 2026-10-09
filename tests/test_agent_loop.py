@@ -478,6 +478,37 @@ def test_usage_is_accumulated_across_rounds(monkeypatch):
     assert run.usage.cache_hit_tokens == 800
 
 
+def test_usage_is_recorded_into_the_trace(monkeypatch):
+    """算出来的真实 token 必须进 trace——否则计量白做。
+
+    曾经 loop 只 count 了调用次数，把 `reply.usage` 丢在 run 对象里没人接。
+    """
+    from priceradar.trace import Trace
+
+    patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    trace = Trace()
+    transport, client = make_agent(monkeypatch, call_tool("c1", "compare_prices", query="x"), answer("好"))
+    loop.run_agent("x", client=client, trace=trace)
+
+    assert trace.tokens.calls == 2                 # 两轮 LLM 调用
+    assert trace.tokens.prompt == 1000             # 只有第一轮带了 usage
+    assert trace.tokens.cache_hit == 800
+    assert trace.tokens.cache_miss == 200
+    assert trace.tokens.cache_hit_rate == pytest.approx(0.8)
+    assert trace.llm_cost_is_estimate is False     # 拿到了 token → 不是粗估
+
+
+def test_trace_without_usage_falls_back_and_says_so(monkeypatch):
+    from priceradar.trace import Trace
+
+    patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})
+    trace = Trace()
+    transport, client = make_agent(monkeypatch, answer("好"))   # 响应里没有 usage
+    loop.run_agent("x", client=client, trace=trace)
+    assert trace.llm_cost_is_estimate is True
+    assert "按次粗估" in trace.summary_line()
+
+
 def test_char_budget_stops_the_loop(monkeypatch):
     """上下文预算兜底：按字符粗估（中文约 1 token/字的上界），超了就不再进下一轮。"""
     patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result(), "长" * 5000)})
