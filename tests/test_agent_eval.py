@@ -77,6 +77,35 @@ def test_tool_selection_accuracy_floor(cassettes):
     assert stats["degrade_rate"] <= DEGRADE_CEILING, f"降级率 {stats['degrade_rate']:.1%} 过高"
 
 
+def test_failure_scenarios_exist_and_do_not_waste_retries(cassettes):
+    """评测集里必须**真的包含失败场景**，否则「错误恢复」无从谈起。
+
+    两个真实失败路径（都是平台侧的、可复现的）：
+    - 拼多多类目空洞（显示器等整机类目返回空）
+    - 非 App 分享的原始链接被拒绝反查
+
+    而硬失败之后**不该重复试探**——那只会白烧配额（拼多多账号限流是已知事故）。
+    """
+    stats = evaluate(cassettes)
+    failure_cases = stats["failure_cases"]
+    assert len(failure_cases) >= 2, "评测集里缺少真实失败场景"
+    assert stats["no_wasted_retry_rate"] == 1.0, (
+        f"有场景在硬失败后还重复试探：{[(c['id'], c['extra_calls_after_failure']) for c in failure_cases]}"
+    )
+    for case in failure_cases:
+        assert case["final_text"].strip(), f"{case['id']} 失败后必须有文字答复，不能空手而归"
+
+
+def test_cassettes_record_the_failure_itself(cassettes):
+    """录制的工具结果里必须能看到那次失败——否则失败路径是编出来的。"""
+    for cassette in cassettes:
+        if cassette["id"] not in ("category_gap", "non_original_link"):
+            continue
+        failures = [item for item in cassette["tool_outcomes"] if not item["ok"]]
+        assert failures, f"{cassette['id']} 应当录到失败"
+        assert failures[0]["retryable"] is False, "这两类失败都是重试无用的"
+
+
 def test_no_replay_errors(cassettes):
     """回放异常非 0 说明循环机制被改坏了（消息配对/memo/降级）。"""
     assert evaluate(cassettes)["replay_errors"] == 0

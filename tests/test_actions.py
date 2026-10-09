@@ -469,6 +469,29 @@ def test_category_gap_error_is_not_retryable(monkeypatch):
     assert "换" in outcome.hint          # 给出可行动作，而不是让模型瞎试
 
 
+def test_non_original_link_error_becomes_actionable(monkeypatch):
+    """平台对「拿普通商品页 URL 来反查」的报错是技术性的，用户看不懂。
+
+    实测：接口自己返回的商品 URL、以及从网页复制的 URL **都不是**「原始链接」，
+    只有 App 里「分享 → 复制链接」那种（含 uin）才行。必须翻成人话。
+    """
+    raw = "该查询参数不是终端用户的原始链接，请使用原始链接进行查询。详细可参考：https://..."
+
+    def boom(keyword, **kw):
+        raise PddApiError(raw)
+
+    monkeypatch.setattr(actions, "run", boom)
+    outcome = actions.run_action("compare_prices", {"query": "https://mobile.yangkeduo.com/goods.html?goods_id=1"})
+    assert outcome.ok is False
+    assert "App" in outcome.hint and "分享" in outcome.hint
+    assert "uin" in outcome.hint              # 点明真正的原因，别让人瞎试
+    assert "原始链接" not in outcome.error or "不是" in outcome.error
+
+
+def test_explain_pdd_error_passes_other_errors_through():
+    assert actions.explain_pdd_error(PddApiError("50001 业务服务错误")) == "50001 业务服务错误"
+
+
 def test_bocha_network_error_is_retryable_via_cause(monkeypatch):
     """BochaError 是包装异常，分类必须沿 __cause__ 链走（红队指出的坑）。"""
     def boom(product):

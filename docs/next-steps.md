@@ -1,6 +1,6 @@
 # 开工清单（Next Steps）
 
-> 更新：2026-10-09 ｜ 状态：M0 收官 + M1 核心件已交付 + **M2 Agent 化 ①~⑧ 全部完成**，**496 个测试全绿**，分支 `feat/agent-loop`
+> 更新：2026-10-09 ｜ 状态：M0 收官 + M1 核心件已交付 + **M2 Agent 化 ①~⑧ 全部完成**，**500 个测试全绿**，分支 `feat/agent-loop`
 > 用法：每天从「⏰ 每日第一件事」开始；本文件随手更新，是所有待办的唯一来源。
 
 > 🆕 **2026-10-08 制定 / 10-09 执行：[Agent 化改造计划](./agent-upgrade-plan.md)**（M2 主线）
@@ -155,7 +155,7 @@ Cursor / Claude Desktop 在 mcpServers JSON 里加（详见 `src/priceradar/mcp_
 ## 🧭 常用命令速查
 
 ```bash
-python -m pytest -q                                              # 测试（496 绿）
+python -m pytest -q                                              # 测试（500 绿）
 python -m priceradar.agent.loop "帮我看看QCY N20哪里买划算，顺便有没有踩坑的"   # 🆕 Agent 循环：LLM 自主决定调哪些工具
 python -m priceradar.agent.pipeline "帮我看看QCY N20哪里买划算"    # 固定管线 CLI（--risk 加风险扫描；--jd-channel 0=自动路由(默认) / -1=关闭京东侧）
 python -m evaluation.agent_eval                                  # 🆕 Agent 行为评测（离线回放录制，零花费）

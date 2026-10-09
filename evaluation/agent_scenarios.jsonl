@@ -4,3 +4,5 @@
 {"id": "risk_only", "query": "QCY N20 这款耳机口碑怎么样，有没有翻车的", "expected_tools": ["scan_risk"], "optional_tools": ["compare_prices"], "note": "只问口碑：风险扫描必需；顺手比个价算合理（列为可选）"}
 {"id": "timing", "query": "QCY N20 现在是不是好价，该不该等双11", "expected_tools": ["check_price_history"], "optional_tools": ["compare_prices"], "note": "时机判断：必须查历史观测；当前价可比可不比"}
 {"id": "similar", "query": "帮我找找和 QCY N20 一样的、但更便宜的", "expected_tools": ["compare_prices", "find_similar"], "note": "找同款更便宜：先用 compare_prices 拿到 goods_sign，再调 find_similar（链条依赖）"}
+{"id": "category_gap", "query": "显示器 27寸 4K 哪个便宜", "expected_tools": ["compare_prices"], "note": "真实失败路径：拼多多该类目返回空。模型应如实转达「这个品类没有可比商品」，不要反复换关键词试探"}
+{"id": "non_original_link", "query": "帮我看看这个值不值 https://mobile.yangkeduo.com/goods.html?goods_id=952633543355", "expected_tools": ["compare_prices"], "note": "真实失败路径：非 App 分享的原始链接会被平台拒绝反查。模型应只试一次、说明真正原因（缺 uin）、给出可行动作，不要换参数乱试"}

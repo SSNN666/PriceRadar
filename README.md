@@ -69,10 +69,10 @@ flowchart TB
 | 报告 | 测什么 | 结果 |
 |---|---|---|
 | [同款匹配 `results_v1.md`](evaluation/results_v1.md) | 218 对构造集（确定性变换 + 人工种子） | 准确率 100%，A 档 Precision / Recall 100% |
-| [Agent 行为 `results_agent.md`](evaluation/results_agent.md) | 6 个场景的**真实模型响应录制 + 离线回放** | 工具选择 6/6、降级率 0%、缓存命中率 78.7% |
+| [Agent 行为 `results_agent.md`](evaluation/results_agent.md) | 8 个场景的**真实模型响应录制 + 离线回放**，含 2 个真实失败路径 | 工具选择 8/8、降级率 0%、硬失败后不重复试探 100%、缓存命中率 79.9% |
 | [向量层 `results_vector.md`](evaluation/results_vector.md) | 文本向量能否用于同款判定 | **否——负结果，故不进判定路径** |
 
-**关于「100%」的诚实说明**：构造集是确定性变换生成的，不代表真实分布；真实标注集（`evaluation/label_tool.py`）仍需人工标注。Agent 评测的 6 个场景同样由人工撰写，样本很小——真正说明问题的是「无多余调用」与「链条依赖被正确解析」。
+**关于「100%」的诚实说明**：构造集是确定性变换生成的，不代表真实分布；真实标注集（`evaluation/label_tool.py`）仍需人工标注。Agent 评测的 8 个场景同样由人工撰写，样本很小——真正说明问题的是那几条**行为**：无多余调用、链条依赖被正确解析（找同款走了 2 轮）、以及两个**真实失败路径**（类目空洞 / 非原始链接）里模型都如实说明了原因、没有徒劳重试。
 
 **向量层为什么被否掉**：纯向量最优阈值下准确率 70.2%（规则同一集合 100%），且**换型号的负例余弦（最高 0.96）高于堆了促销词的真同款（最低 0.91）**——分布重叠。`N20` 与 `N60` 在语义空间里几乎是一回事，在商品世界里是两件东西。测试里有护栏钉住 `matcher.py` 不依赖向量。
 
@@ -81,7 +81,7 @@ flowchart TB
 ```bash
 python -m venv .venv
 .venv/Scripts/pip install -e ".[dev]"     # Windows；Linux/macOS 用 .venv/bin/pip
-pytest                                    # 496 个测试
+pytest                                    # 500 个测试
 
 python -m priceradar.service.api          # Web → http://127.0.0.1:8000（自动开浏览器）
                                           # Windows 也可双击「启动真价雷达.bat」

@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from priceradar.agent import actions
-from priceradar.agent.actions import compare_prices
+from priceradar.agent.actions import compare_prices, explain_pdd_error
 from priceradar.agent.loop import run_agent
 from priceradar.agent.pipeline import PipelineResult
 from priceradar.domain.models import CERTIFIED_SHOP_KINDS, SHOP_KIND_LABELS, Offer
@@ -566,7 +566,7 @@ def api_search(
     try:
         return execute_search(q, jd_channel, llm, risk)
     except PddApiError as exc:
-        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{exc}") from exc
+        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{explain_pdd_error(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -577,7 +577,7 @@ def api_similar(goods_sign: str = Query(..., min_length=1), limit: int = 20) -> 
     try:
         return execute_similar(goods_sign, limit=limit)
     except PddApiError as exc:
-        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{exc}") from exc
+        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{explain_pdd_error(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

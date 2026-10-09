@@ -505,8 +505,28 @@ _HINT_TRANSIENT = "网络瞬时故障。可以稍后原样重试；若连续失�
 _HINT_BUSINESS = "这是参数/权限/凭证类错误，原样重试没有用。请调整参数，或改用其它工具。"
 _HINT_NO_RESULT = "这不是故障：该关键词/类目在数据源侧没有可比商品。请换关键词或品类，或请用户直接粘贴商品链接。"
 
+# 平台对「拿普通商品页 URL 来反查」的报错是技术性的，用户看不懂。
+# 实测：接口返回的商品 URL、以及从网页复制来的 URL **都不是**「原始链接」，
+# 只有 App 里「分享 → 复制链接」拿到的那种（含 uin 参数）才行。
+_ORIGINAL_LINK_MARKER = "原始链接"
+_ORIGINAL_LINK_MESSAGE = (
+    "这个链接不是拼多多 App 分享出来的「原始链接」（缺少 uin 等参数），平台会拒绝反查。"
+    "请在拼多多 App 里用「分享 → 复制链接」重新获取，并**原样粘贴、不要删改参数**"
+    "（尤其是 uin——它是平台校验原始链接的凭据）。"
+)
+
+
+def explain_pdd_error(error: BaseException) -> str:
+    """把拼多多的技术性报错翻成用户能照着做的话；其余原样返回。"""
+    text = str(error)
+    if _ORIGINAL_LINK_MARKER in text:
+        return _ORIGINAL_LINK_MESSAGE
+    return text
+
 
 def _hint_for(error: BaseException, retryable: bool) -> str:
+    if _ORIGINAL_LINK_MARKER in str(error):
+        return _ORIGINAL_LINK_MESSAGE
     if isinstance(error, ValueError):   # 类目空洞 / 无结果
         return _HINT_NO_RESULT
     return _HINT_TRANSIENT if retryable else _HINT_BUSINESS
@@ -575,6 +595,7 @@ __all__ = [
     "SimilarResult",
     "apply_user_coupons",
     "check_price_history",
+    "explain_pdd_error",
     "compare_prices",
     "find_similar",
     "merge_user_coupons",

@@ -442,6 +442,14 @@ function renderAgentAnswer(data) {
     ? data.tools.map((n) => TOOL_LABELS[n] || n).join(" → ")
     : "（未调用工具）";
   const bits = [`${data.rounds} 轮`, tools];
+  const usage = data.usage || {};
+  // 把成本与缓存命中率摆出来：这两项是「Agent 花不花钱」的直接答案，
+  // 藏进日志就等于没计量（缓存命中与未命中单价差 30-50 倍）
+  if (usage.prompt_tokens) {
+    bits.push(`token 入 ${usage.prompt_tokens}/出 ${usage.completion_tokens}`);
+    if (usage.cache_hit_tokens !== undefined) bits.push(`缓存命中 ${Math.round((usage.cache_hit_rate || 0) * 100)}%`);
+  }
+  if (usage.cost && usage.cost !== "0") bits.push(`≈￥${usage.cost}${usage.cost_is_estimated ? "（按次粗估）" : ""}`);
   if (data.degraded) bits.push(`⚠️ 已降级：${data.stopped_by}`);
   box.innerHTML = `<div class="agent-meta">${esc(bits.join(" · "))}</div>
     <div class="agent-text">${esc(data.final_text || "（模型未给出文字答复）")}</div>`;

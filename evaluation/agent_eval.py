@@ -271,6 +271,10 @@ def evaluate(cassettes: list[dict]) -> dict:
             called, stopped_by, steps, error = [], "replay_error", 0, f"{type(exc).__name__}: {exc}"
             usage = Usage()
         called_set = set(called)
+        # 硬失败 = 重试也没用的失败（业务/参数类）。这类失败之后**不该再重复试探**
+        # ——那只会白烧配额（拼多多账号限流是已知事故）。
+        outcomes = cassette.get("tool_outcomes", [])
+        hard_failures = [item for item in outcomes if not item.get("ok") and not item.get("retryable")]
         per_case.append(
             {
                 "id": cassette["id"],
@@ -279,6 +283,9 @@ def evaluate(cassettes: list[dict]) -> dict:
                 "expected": list(expected),
                 "optional": list(optional),
                 "called": called,
+                "hard_failures": len(hard_failures),
+                "extra_calls_after_failure": max(0, len(called) - len(expected)) if hard_failures else 0,
+                "final_text": cassette.get("observed", {}).get("final_text", ""),
                 # 完全一致 = 必需的工具都调了，且没有调允许范围之外的
                 "exact_match": set(expected) <= called_set <= allowed,
                 "recall": (len(called_set & set(expected)) / len(expected)) if expected else 1.0,
@@ -297,9 +304,11 @@ def evaluate(cassettes: list[dict]) -> dict:
     total = len(per_case)
     if not total:
         return {"total": 0, "cases": []}
+    failure_cases = [case for case in per_case if case["hard_failures"]]
     return {
         "total": total,
         "cases": per_case,
+        "failure_cases": failure_cases,
         "tool_selection_accuracy": sum(c["exact_match"] for c in per_case) / total,
         "tool_recall": sum(c["recall"] for c in per_case) / total,
         "no_extra_call_rate": sum(c["no_extra"] for c in per_case) / total,
@@ -308,6 +317,12 @@ def evaluate(cassettes: list[dict]) -> dict:
         "avg_prompt_tokens": sum(c["prompt_tokens"] for c in per_case) / total,
         "avg_cache_hit_rate": sum(c["cache_hit_rate"] for c in per_case) / total,
         "replay_errors": sum(c["error"] is not None for c in per_case),
+        # 「硬失败之后不重复试探」——直接对应「别白烧配额」那条设计
+        "no_wasted_retry_rate": (
+            sum(case["extra_calls_after_failure"] == 0 for case in failure_cases) / len(failure_cases)
+            if failure_cases
+            else 1.0
+        ),
     }
 
 
@@ -332,6 +347,8 @@ def render_report(stats: dict, *, title: str, dataset_note: str) -> str:
         f"| 平均提示 token | {stats['avg_prompt_tokens']:.0f} | 多轮累计 |",
         f"| 平均缓存命中率 | {stats['avg_cache_hit_rate']:.1%} | 命中与未命中单价差 30-50 倍 |",
         f"| 回放异常 | {stats['replay_errors']} | 非 0 说明循环行为与录制时不一致 |",
+        f"| 硬失败后不重复试探 | {stats.get('no_wasted_retry_rate', 1.0):.1%} | "
+        f"{len(stats.get('failure_cases', []))} 个真实失败场景里，没有多余重试的比例 |",
         "",
         "## 逐条",
         "",
@@ -344,6 +361,21 @@ def render_report(stats: dict, *, title: str, dataset_note: str) -> str:
             f"| {case['id']} | {'、'.join(case['expected'])} | {'、'.join(case['called']) or '—'} "
             f"| {mark} | {case['steps']} | {case['stopped_by']} |"
         )
+    failure_cases = stats.get("failure_cases", [])
+    if failure_cases:
+        lines += [
+            "",
+            "## 失败路径（这些场景里工具**真的失败了**，看模型怎么处理）",
+            "",
+            "| 场景 | 硬失败次数 | 多余重试 | 模型最终怎么说的 |",
+            "|---|---|---|---|",
+        ]
+        for case in failure_cases:
+            said = (case["final_text"] or "").replace("\n", " ").strip()[:90]
+            lines.append(
+                f"| {case['id']} | {case['hard_failures']} | {case['extra_calls_after_failure']} | {said}… |"
+            )
+
     mismatches = [case for case in stats["cases"] if not case["exact_match"]]
     if mismatches:
         lines += ["", "## 不一致的场景（值得逐条看）", ""]
@@ -367,6 +399,10 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(description="Agent 行为评测（录制 / 回放）")
     parser.add_argument("--live", action="store_true", help="跑真实模型并录制（会花钱与配额）")
+    parser.add_argument(
+        "--only", nargs="*", metavar="ID",
+        help="只录制这些场景（省花费；不加则录全部）。已有录制会被覆盖。",
+    )
     args = parser.parse_args(argv)
 
     scenarios = load_scenarios()
@@ -374,8 +410,16 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"没有场景集：{SCENARIOS}")
 
     if args.live:
-        print(f"真实录制 {len(scenarios)} 个场景……")
-        record_all(scenarios)
+        targets = scenarios
+        if args.only:
+            wanted = set(args.only)
+            unknown = wanted - {scenario.id for scenario in scenarios}
+            if unknown:
+                raise SystemExit(f"场景集里没有：{'、'.join(sorted(unknown))}")
+            # 只重录指定场景：既省花费，也避免把已核验过的录制一起换掉
+            targets = [scenario for scenario in scenarios if scenario.id in wanted]
+        print(f"真实录制 {len(targets)} 个场景……")
+        record_all(targets)
 
     cassettes = load_cassettes()
     if not cassettes:

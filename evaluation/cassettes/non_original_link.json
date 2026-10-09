@@ -1,0 +1,62 @@
+{
+ "id": "non_original_link",
+ "query": "帮我看看这个值不值 https://mobile.yangkeduo.com/goods.html?goods_id=952633543355",
+ "expected_tools": [
+  "compare_prices"
+ ],
+ "optional_tools": [],
+ "note": "真实失败路径：非 App 分享的原始链接会被平台拒绝反查。模型应只试一次、说明真正原因（缺 uin）、给出可行动作，不要换参数乱试",
+ "recorded_at": "2026-10-09T14:11:49",
+ "model": "deepseek-chat",
+ "llm_replies": [
+  {
+   "content": "我先拿这个拼多多链接去比一下各平台的到手价。",
+   "finish_reason": "tool_calls",
+   "tool_calls": [
+    {
+     "id": "call_00_LhLBuAI1ws6KG2cdy1BL1873",
+     "name": "compare_prices",
+     "arguments": {
+      "query": "https://mobile.yangkeduo.com/goods.html?goods_id=952633543355"
+     },
+     "raw": "{\"query\": \"https://mobile.yangkeduo.com/goods.html?goods_id=952633543355\"}"
+    }
+   ],
+   "usage": {
+    "prompt_tokens": 1279,
+    "completion_tokens": 69,
+    "cache_hit_tokens": 1024,
+    "cache_miss_tokens": 255
+   }
+  },
+  {
+   "content": "这个链接查不了，不是我不给力——拼多多那边直接拒了。\n\n原因：你这条链接缺少 `uin` 这类参数，不是拼多多 App「分享 → 复制链接」出来的原始链接，平台会拒绝反查。这个错误重试也没用（工具明确标了不可重试）。\n\n麻烦你在拼多多 App 里打开这个商品，点「分享 → 复制链接」，把那一整条**原样粘贴**给我，别删改任何参数（尤其 `uin`），我马上帮你比各平台到手价。\n\n另外如果你手头有商品名或型号，也可以直接告诉我，我用关键词也能查。",
+   "finish_reason": "stop",
+   "tool_calls": [],
+   "usage": {
+    "prompt_tokens": 1484,
+    "completion_tokens": 135,
+    "cache_hit_tokens": 1280,
+    "cache_miss_tokens": 204
+   }
+  }
+ ],
+ "tool_outcomes": [
+  {
+   "ok": false,
+   "action": "compare_prices",
+   "summary": "",
+   "error": "PddApiError: 该查询不是来自终端用户的原始链接，请使用原始链接进行查询，详细可参考：https://jinbao.pinduoduo.com/qa-system?questionId=388",
+   "retryable": false,
+   "hint": "这个链接不是拼多多 App 分享出来的「原始链接」（缺少 uin 等参数），平台会拒绝反查。请在拼多多 App 里用「分享 → 复制链接」重新获取，并**原样粘贴、不要删改参数**（尤其是 uin——它是平台校验原始链接的凭据）。"
+  }
+ ],
+ "observed": {
+  "stopped_by": "finish",
+  "final_text": "这个链接查不了，不是我不给力——拼多多那边直接拒了。\n\n原因：你这条链接缺少 `uin` 这类参数，不是拼多多 App「分享 → 复制链接」出来的原始链接，平台会拒绝反查。这个错误重试也没用（工具明确标了不可重试）。\n\n麻烦你在拼多多 App 里打开这个商品，点「分享 → 复制链接」，把那一整条**原样粘贴**给我，别删改任何参数（尤其 `uin`），我马上帮你比各平台到手价。\n\n另外如果你手头有商品名或型号，也可以直接告诉我，我用关键词也能查。",
+  "steps": 1,
+  "tools_called": [
+   "compare_prices"
+  ]
+ }
+}
