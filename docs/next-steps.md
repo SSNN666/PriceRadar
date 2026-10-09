@@ -1,11 +1,15 @@
 # 开工清单（Next Steps）
 
-> 更新：2026-10-08 ｜ 状态：M0 收官 + M1 核心件已交付，**300 个测试全绿**，**仓库已首次提交（90e0819）**
+> 更新：2026-10-09 ｜ 状态：M0 收官 + M1 核心件已交付 + **M2 Agent 化 ①~⑤ 完成**，**407 个测试全绿**，分支 `feat/agent-loop`
 > 用法：每天从「⏰ 每日第一件事」开始；本文件随手更新，是所有待办的唯一来源。
 
-> 🆕 **2026-10-08 制定：[Agent 化改造计划](./agent-upgrade-plan.md)**（M2 主线，尚未动工）
+> 🆕 **2026-10-08 制定 / 10-09 执行：[Agent 化改造计划](./agent-upgrade-plan.md)**（M2 主线）
 > 一句话：项目叫 Agent 却没有 Agent——LLM 只在关键词提取与报告导语两个边缘干活，管线是完全写死的。
-> 该计划把它改成 **确定性内核 + Agent 外壳**（LLM 自主选工具，钱仍不由 LLM 算）。**计划已经过红队复核，5 处初版设计被推翻**，动工前务必先读那节。
+> 该计划把它改成 **确定性内核 + Agent 外壳**（LLM 自主选工具，钱仍不由 LLM 算）。
+> **进度：①~⑤ 已完成（5 个 commit，300 → 407 测试）**，剩 ⑥ 多轮会话、⑦ 向量层（见下）。
+>
+> 新命令：`python -m priceradar.agent.loop "帮我看看QCY N20哪里买划算，顺便有没有踩坑的"`
+> 新接口：`GET /api/agent/stream`（SSE，Web 默认走它）；Web 上有「Agent 模式」开关可切回固定管线。
 
 ---
 
@@ -74,11 +78,13 @@
 
 执行顺序（按简历价值 / 单位工作量，**不要打乱**）：
 
-- [ ] **① actions 工具层**——新建 `agent/actions.py`（4 个意图级工具）；把 `execute_similar` 核心与 `merge_user_coupons` **从服务层下沉**；`execute_search`/`execute_similar` 改薄委托但**签名一字不动**（`tests/test_service.py` 6 处 monkeypatch 不动）；MCP **签名保持平铺**、只改函数体委托
-- [ ] **② Agent 循环**——`llm.py` 加 `chat()`（`complete` 原样保留）+ `loop.py`（max_steps / 结果 memo / 截断补齐 tool 消息 / 降级复用不重跑 / 逐事件 `on_event`）
-- [ ] **③ agent_eval**——机制测试 + **真实响应录制回放**（没有回放就报不出真数字，`ScriptedTransport` 的准确率必然 100%）+ 护栏 floor
-- [ ] **④ SSE + 前端 `#agent-out` 面板**——同步生成器（已实测）；`es.close()` 防 EventSource 重连重跑
-- [ ] **⑤ MCP 去重**——**必须等 ① 的语义定型**，否则改两遍
+**①②③④⑤ 已完成（2026-10-09，5 个 commit，测试 300 → 407）**
+
+- [x] **① actions 工具层**（`2611650`）——新建 `agent/actions.py`（4 个意图级工具 + pydantic 入参 + 定长摘要）；`execute_similar` 核心与 `merge_user_coupons` 下沉；服务层改薄委托（签名一字未动，测试打桩点不受影响）；删掉 `tools.py` 的死注册表 `TOOLS`
+- [x] **② Agent 循环**（`5850531`）——`llm.chat()`（`complete` 原样保留）+ `loop.py`；按工具定的重试策略（**pdd 系 retry=none**，客户端内部已重试 3 次；bocha retry=once）；结果 memo；截断补齐 tool 消息；降级复用不重跑
+- [x] **③ agent_eval**（`eb2b6cc`）——真实响应录制 + 离线回放 + 护栏；首测 6 场景：工具选择 6/6、降级率 0%、缓存命中率 78.7%
+- [x] **④ SSE + 前端 `#agent-out`**（`e065b22`）——同步生成器 + 后台线程队列（实测首帧 1.2s 到达）；`es.close()` 防重连重跑；真实端到端跑出并修掉一个「final 事件发两次 → 卡片永不显示」的 bug
+- [x] **⑤ MCP 去重**（`6e53dda`）——MCP 委托共享编排，顺带修掉「MCP 侧不并入用户补录券」的既存不一致
 - [ ] **⑥ 多轮会话（最小形态）**——session_id + 槽位 + 最近 1-2 个完整 turn；**不做滚动摘要**。⚠️ 前置：PRD §4.2 承诺的「帮我盯着降价」**目前没有 `POST /api/watchlist`**，先加 API 或先不放按钮
 - [ ] **⑦ 向量层**——**先测量再决定**（默认不做）；唯一可测量的是 `channel_type=3` 推荐集去噪（现精度 33-47%）。⚠️ 与 PRD/简历策略承诺的「bge 本地」叙事冲突，改 API 需同步改说法
 
@@ -140,9 +146,12 @@ Cursor / Claude Desktop 在 mcpServers JSON 里加（详见 `src/priceradar/mcp_
 ## 🧭 常用命令速查
 
 ```bash
-python -m pytest -q                                              # 测试（300 绿）
-python -m priceradar.agent.pipeline "帮我看看QCY N20哪里买划算"    # 全链路 CLI（--risk 加风险扫描；--jd-channel 0=自动路由(默认) / -1=关闭京东侧）
-python -m priceradar.service.api                                 # Web → :8000（搜索 + 快照按钮；自动开浏览器）
+python -m pytest -q                                              # 测试（407 绿）
+python -m priceradar.agent.loop "帮我看看QCY N20哪里买划算，顺便有没有踩坑的"   # 🆕 Agent 循环：LLM 自主决定调哪些工具
+python -m priceradar.agent.pipeline "帮我看看QCY N20哪里买划算"    # 固定管线 CLI（--risk 加风险扫描；--jd-channel 0=自动路由(默认) / -1=关闭京东侧）
+python -m evaluation.agent_eval                                  # 🆕 Agent 行为评测（离线回放录制，零花费）
+python -m evaluation.agent_eval --live                           # 🆕 重新录制（会花钱与配额，约 ¥0.5）
+python -m priceradar.service.api                                 # Web → :8000（Agent 流式 + 快照按钮；自动开浏览器）
 #   或：双击根目录「启动真价雷达.bat」一键启动
 python -m priceradar.jobs.snapshot [--report]                    # 快照采集 / 查看概况
 python -m priceradar.jobs.jd_pool [--report]                     # 刷新京东频道池缓存（查询走缓存，毫秒级）
