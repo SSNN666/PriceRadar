@@ -1,16 +1,21 @@
-"""工具层：把确定性能力封装成统一签名的工具。
+"""底层原语：把确定性能力封装成统一签名的函数。
 
 设计原则：
-- 每个工具只做一件事；参数/返回一律用领域模型，不用裸 dict
-- 工具失败抛各自领域异常（PddApiError / JdApiError），由编排层决定降级策略
-- 该注册表是未来 LangGraph 节点与 MCP Server 的工具来源（写一次，两处消费）
+- 每个函数只做一件事；参数/返回一律用领域模型，不用裸 dict
+- 失败抛各自领域异常（PddApiError / JdApiError），由编排层决定降级策略
+
+**这里不是 Agent 的工具注册表**——消费者是：`agent/pipeline.py`（管线内部）、
+`agent/actions.py`（意图级能力）、`jobs/snapshot.py`（批量采集）。
+面向 LLM 的工具注册表在 `agent/actions.py`（带参数 schema，可导出 OpenAI tools）。
+
+（历史上这里曾有一个 `TOOLS` 注册表，注释声称要当"LangGraph 节点与 MCP Server 的
+工具来源"，但从未被任何代码消费、也没有参数 schema，已于 2026-10-09 删除——
+它的继任者是 `actions.ACTIONS`。）
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any, Callable
 
 from priceradar.domain.models import Offer
 from priceradar.engine.pricing import PriceBreakdown, compute_price
@@ -145,22 +150,3 @@ def compute_best_price(offer: Offer) -> PriceBreakdown:
 def match_same_product(source: Offer, candidates: list[Offer]) -> MatchReport:
     """同款匹配：规格硬规则 + 相似度 sanity + A/B/C 分档（含排除原因）。"""
     return match_offers(source, candidates)
-
-
-@dataclass(frozen=True)
-class Tool:
-    name: str
-    description: str
-    func: Callable[..., Any]
-
-
-TOOLS: dict[str, Tool] = {
-    tool.name: tool
-    for tool in (
-        Tool("search_pdd_goods", "拼多多关键词搜索商品", search_pdd_goods),
-        Tool("search_jd_goods", "京东按关键词检索商品（品类路由 + 关键词过滤）", search_jd_goods),
-        Tool("search_jd_channel", "京东京粉精选频道商品（按频道 ID，定点排查用）", search_jd_channel),
-        Tool("compute_best_price", "计算单个商品报价的公开优惠口径到手价", compute_best_price),
-        Tool("match_same_product", "在候选池中找出同款（输出 A/B/C 分档）", match_same_product),
-    )
-}

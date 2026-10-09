@@ -3,7 +3,8 @@
 - GET /            ：单页界面（输入 → 同款组 + 到手价对比卡）
 - GET /api/search  ：查询接口（q / jd_channel / llm），返回结构化 JSON
 
-设计：服务层只做"参数 → 管线 → 序列化"，全部业务在 agent/pipeline；
+设计：**服务层只做 HTTP 与序列化**——业务编排在 `agent/actions`（与 MCP Server、
+Agent 循环共用同一份实现），这里不再自己拼流程。
 LLM 默认启用（有 key 时），失败自动确定性兜底。
 """
 
@@ -17,15 +18,14 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from priceradar.agent.llm import DeepSeekClient, LlmError
-from priceradar.agent.llm_nodes import compose_summary, extract_keyword
-from priceradar.agent.pipeline import PipelineResult, run
+from priceradar.agent import actions
+from priceradar.agent.actions import compare_prices
+from priceradar.agent.pipeline import PipelineResult
 from priceradar.domain.models import CERTIFIED_SHOP_KINDS, SHOP_KIND_LABELS, Offer
 from priceradar.engine.pricing import PriceBreakdown
 from priceradar.formatting import fmt_amount
 from priceradar.insights import assess_quality, campaign_context, decide, price_drops
 from priceradar.report import PLATFORM_LABELS, REASON_LABELS
-from priceradar.risk import cluster_issues
 from priceradar.sources.pdd import PddApiError
 from priceradar.vision import CouponExtraction, to_offer_coupons
 
@@ -195,62 +195,18 @@ def to_payload(result: PipelineResult) -> dict:
 
 
 def execute_search(query: str, jd_channel: int, use_llm: bool, use_risk: bool = False) -> dict:
-    """执行一次查询（LLM 理解 → 管线 → LLM 总结/风险聚类 → 序列化）。测试可直接打桩此函数。"""
-    llm_client: DeepSeekClient | None = None
-    if use_llm:
-        try:
-            llm_client = DeepSeekClient.from_env()
-        except LlmError:
-            llm_client = None
+    """执行一次查询（业务编排在 `agent.actions`，这里只做 HTTP 层的序列化）。
 
-    keyword, _ = extract_keyword(query, llm_client)
-    result = run(
-        keyword,
-        jd_enabled=jd_channel >= 0,
-        jd_elite_id=jd_channel if jd_channel > 0 else None,
-        with_risk=use_risk,
-    )
-    merged = apply_user_coupons(result)
-    if merged:
-        result.notes.append(f"已并入 {merged} 张用户补录券（明细含 [补录] 标记）")
-    result.summary, _ = compose_summary(result, llm_client)
-    if result.risk is not None:
-        result.risk = cluster_issues(result.risk, llm_client)
+    测试可直接打桩此函数（签名与返回值契约保持不变）。
+    """
+    result = compare_prices(query, jd_channel=jd_channel, use_risk=use_risk, use_llm=use_llm)
     return to_payload(result)
 
 
-def merge_user_coupons(breakdowns: list[tuple[Offer, PriceBreakdown]]) -> tuple[int, list[tuple[Offer, PriceBreakdown]]]:
-    """在**已算好**的 breakdown 上并入用户补录券（无用户库/无券时原样返回、不重算）。
-
-    刻意不重算：管线算价可能带 as_of 等参数，重算未必等价。
-    """
-    from priceradar.engine.pricing import compute_price
-    from priceradar.user_store import DEFAULT_DB, connect_user_db, load_active_coupons
-
-    if not Path(DEFAULT_DB).exists():
-        return 0, breakdowns
-    connection = connect_user_db()
-    try:
-        merged = 0
-        updated: list[tuple[Offer, PriceBreakdown]] = []
-        for offer, breakdown in breakdowns:
-            user_coupons = load_active_coupons(connection, offer.platform.value)
-            if not user_coupons:
-                updated.append((offer, breakdown))
-                continue
-            merged_offer = offer.model_copy(update={"coupons": list(offer.coupons) + user_coupons})
-            updated.append((merged_offer, compute_price(merged_offer)))
-            merged += len(user_coupons)
-        return merged, updated
-    finally:
-        connection.close()
-
-
-def apply_user_coupons(result: PipelineResult) -> int:
-    """把已确认的用户补录券并入到手价重算。返回并入张数。"""
-    merged, breakdowns = merge_user_coupons(result.breakdowns)
-    result.breakdowns = breakdowns
-    return merged
+# 用户补录券并入的实现已下沉到 `agent.actions`（MCP 侧也要用，放服务层会造成反向依赖）。
+# 这里保留同名再导出，既有的调用点与测试打桩不受影响。
+merge_user_coupons = actions.merge_user_coupons
+apply_user_coupons = actions.apply_user_coupons
 
 
 def execute_similar(goods_sign: str, limit: int = 20) -> dict:
@@ -258,27 +214,15 @@ def execute_similar(goods_sign: str, limit: int = 20) -> dict:
 
     与关键词搜索的区别：关键词搜"保温杯"会返回一堆款式各异的商品；以某个商品为锚点
     则由**平台自己**给出相似商品——这才对应"看到一件东西，想找一样的但更便宜的"。
+
+    编排在 `agent.actions.find_similar`；这里只做序列化。
     """
-    from priceradar.engine.pricing import compute_price
-    from priceradar.sources.pdd import PddClient
-
-    offers = PddClient.from_env().recommend_similar(goods_sign, limit=limit)
-    if not offers:
-        raise ValueError("未找到相似商品（该商品可能已下架，或平台无相似推荐）")
-
-    merged, breakdowns = merge_user_coupons([(offer, compute_price(offer)) for offer in offers])
-    notes = [
-        "相似商品由平台推荐（pdd.ddk.goods.recommend.get, channel_type=3）返回，"
-        "**混合有无关商品**——实测精度随品类差异大（保温杯 100% / 降噪耳机 ~47% / 连衣裙 ~33%），"
-        "请自行核对。",
-    ]
-    if merged:
-        notes.append(f"已并入 {merged} 张用户补录券（明细含 [补录] 标记）")
+    result = actions.find_similar(goods_sign, limit=limit)
     return {
-        "anchor_sign": goods_sign,
-        "count": len(breakdowns),
-        "offers": [offer_payload(offer, breakdown, group_count=1) for offer, breakdown in breakdowns],
-        "notes": notes,
+        "anchor_sign": result.anchor_sign,
+        "count": len(result.breakdowns),
+        "offers": [offer_payload(offer, breakdown, group_count=1) for offer, breakdown in result.breakdowns],
+        "notes": result.notes,
     }
 
 
