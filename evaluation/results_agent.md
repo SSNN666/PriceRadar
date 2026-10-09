@@ -1,7 +1,7 @@
 # Agent 行为评测
 
 > ⚠️ **这些指标来自真实录制，不是当前模型的实时表现。**
-> 录制于 2026-10-09T14:11:46，模型 `deepseek-chat`，共 8 个场景。
+> 录制于 2026-10-09T13:27:40 ~ 2026-10-09T14:11:49（分批录制），模型 `deepseek-chat`，共 8 个场景。
 > 要刷新就重跑 `python -m evaluation.agent_eval --live`。
 > 期望的工具集合由人工撰写（`evaluation/agent_scenarios.jsonl`），可随时改。
 > 回放全程零网络、零 API 花费。

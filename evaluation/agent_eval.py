@@ -443,8 +443,12 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("没有录制可回放。先跑 --live。")
 
     stats = evaluate(cassettes)
-    stamp = cassettes[0].get("recorded_at", "未知")
-    model = cassettes[0].get("model", "未知")
+    # 别只报第一条的时间：用 `--only` 分批补录过之后，各条 cassette 的录制时间不同，
+    # 写成同一个时间点等于给数据编了个不存在的出处
+    stamps = sorted({c.get("recorded_at", "") for c in cassettes if c.get("recorded_at")})
+    models = sorted({c.get("model", "") for c in cassettes if c.get("model")})
+    stamp = f"{stamps[0]} ~ {stamps[-1]}（分批录制）" if len(stamps) > 1 else (stamps[0] if stamps else "未记录")
+    model = "、".join(models) if models else "未知"
     note = (
         f"> ⚠️ **这些指标来自真实录制，不是当前模型的实时表现。**\n"
         f"> 录制于 {stamp}，模型 `{model}`，共 {stats['total']} 个场景。\n"

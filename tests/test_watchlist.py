@@ -48,6 +48,23 @@ def test_add_strips_whitespace_and_dedupes():
     assert keywords == ["保温杯"]
 
 
+def test_string_keywords_is_treated_as_one_keyword(isolated_watchlist):
+    """`watchlist.json` 是手改文件，很容易把列表写成裸字符串。
+
+    直接迭代字符串会把它拆成单个字符，关注清单就变成了「Q」「C」「Y」……
+    每日快照会去搜一堆单字。
+    """
+    isolated_watchlist.write_text('{"keywords": "QCY N20", "jd_elite_id": 0}', encoding="utf-8")
+    snapshot.add_watch_keyword("保温杯")
+    assert snapshot.load_watchlist()["keywords"] == ["QCY N20", "保温杯"]
+
+
+def test_junk_entries_in_keywords_are_ignored(isolated_watchlist):
+    isolated_watchlist.write_text('{"keywords": ["  ", "A", "", "A"], "jd_elite_id": 0}', encoding="utf-8")
+    keywords, added = snapshot.add_watch_keyword("B")
+    assert keywords == ["A", "B"] and added is True
+
+
 def test_add_rejects_blank():
     with pytest.raises(ValueError):
         snapshot.add_watch_keyword("   ")

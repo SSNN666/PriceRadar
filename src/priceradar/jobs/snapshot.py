@@ -220,8 +220,15 @@ def save_watchlist(watchlist: dict, path: Path | None = None) -> None:
     path.write_text(json.dumps(watchlist, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _normalise_keywords(keywords: list[str]) -> list[str]:
-    """去空白、去重、保序（顺手丢掉空串）。"""
+def _normalise_keywords(keywords) -> list[str]:
+    """去空白、去重、保序（顺手丢掉空串）。
+
+    ⚠️ `keywords` 可能是**字符串**——`data/watchlist.json` 是手改文件，很容易
+    把 `"keywords": ["A", "B"]` 写成 `"keywords": "A"`。直接迭代字符串会把它
+    拆成单个字符，于是关注清单变成 `["A"]` 的每个字母，每日快照去搜一堆单字。
+    """
+    if isinstance(keywords, str):
+        keywords = [keywords]
     seen: set[str] = set()
     result: list[str] = []
     for raw in keywords or []:
