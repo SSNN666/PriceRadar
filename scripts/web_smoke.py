@@ -181,6 +181,7 @@ def check(dom: str) -> list[tuple[str, bool, str]]:
         ("决策卡渲染出来了", "dtier" in dom or "推荐" in dom, "没有决策卡"),
         ("报价列表渲染出来了", "offer" in dom, "没有报价条目"),
         ("成本已计量", "缓存命中" in dom, "元信息里没有 token / 缓存字段"),
+        ("券面板渲染出来了", "我的优惠券" in dom, "没有券面板"),
     ]
 
 

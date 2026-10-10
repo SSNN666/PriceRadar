@@ -13,7 +13,7 @@ from scripts.web_smoke import check, error_text
 
 HEALTHY = (
     '<div id="error" class="error hidden"></div>'
-    "Agent 正在工作 agent-tool ok agent-text dtier offer 缓存命中"
+    "Agent 正在工作 agent-tool ok agent-text dtier offer 缓存命中 我的优惠券"
 )
 
 BROKEN_TOOL = (
@@ -23,7 +23,7 @@ BROKEN_TOOL = (
 
 WITH_ERROR = (
     '<div id="error" class="error">出错了：拼多多检索失败</div>'
-    "Agent 正在工作 agent-tool ok agent-text dtier offer 缓存命中"
+    "Agent 正在工作 agent-tool ok agent-text dtier offer 缓存命中 我的优惠券"
 )
 
 
@@ -33,7 +33,7 @@ def failures(dom: str) -> list[str]:
 
 def test_healthy_page_passes_everything():
     assert failures(HEALTHY) == []
-    assert len(check(HEALTHY)) == 8
+    assert len(check(HEALTHY)) == 9
 
 
 def test_failed_tool_is_detected():
@@ -47,7 +47,7 @@ def test_error_div_content_is_detected():
 
 def test_empty_dom_fails_almost_everything():
     """页面根本没渲染出来时必须大面积失败——不能因为「没找到报错容器」而假通过。"""
-    assert len(failures("")) >= 7
+    assert len(failures("")) >= 8
 
 
 def test_missing_error_div_is_a_failure_not_a_pass():
@@ -73,7 +73,7 @@ def test_error_text_handles_multiline_content():
 
 @pytest.mark.parametrize(
     "marker",
-    ["agent-tool ok", "agent-text", "dtier", "offer", "缓存命中"],
+    ["agent-tool ok", "agent-text", "dtier", "offer", "缓存命中", "我的优惠券"],
 )
 def test_each_required_marker_is_actually_required(marker):
     """逐个拿掉必需元素，检查必须跟着失败——防止某个断言写成了恒真。"""

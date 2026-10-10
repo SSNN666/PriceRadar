@@ -124,6 +124,9 @@
   <div id="similar-out"></div>
   <div id="drops"></div>
   <div id="watchlist"></div>
+  <!-- 券面板：上半是你补录的券（可删），下半是当前商品可领的券。
+       独立容器——不能复用 #vision-out，否则与确认卡互相清空。 -->
+  <div id="coupons"></div>
   <div id="vision-out"></div>
 </div>
 <script>
@@ -215,32 +218,107 @@ $("couponInput").onchange = async (event) => {
   event.target.value = "";
 };
 
+// 券型中文名（后端 type 是英文枚举）
+const COUPON_TYPE_LABELS = { shop: "店铺券", platform: "平台券", category: "品类券", member: "会员券", collect: "店铺收藏券" };
+// 券的平台代码 ↔ payload 里的中文标签
+const PLATFORM_LABEL_BY_CODE = { pdd: "拼多多", jd: "京东", taobao: "淘宝" };
+
+// 绑定候选：本次查询结果里去重后的商品（携带绑定键）。
+// 实测拼多多不返回店铺名也不返回店铺 id，券截图上的店名无处可比——
+// 所以绑定靠"用户挑一个商品、系统反查它的标识"，而不是让用户手输店名。
+function bindingCandidates(platformCode) {
+  const label = PLATFORM_LABEL_BY_CODE[platformCode] || "";
+  const offers = (lastData && lastData.offers) || [];
+  const seen = new Set();
+  const out = [];
+  for (const o of offers) {
+    if (label && o.platform !== label) continue;
+    const key = o.shop_id || o.shop || o.title;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ shop_id: o.shop_id || "", shop_name: o.shop || "", category_ids: o.category_ids || [], title: o.title || "" });
+  }
+  return out;
+}
+
+function bindingOptionsHTML(candidates) {
+  return [`<option value="">不绑定（这张券不会自动套用）</option>`]
+    .concat(candidates.map((c, i) => {
+      const where = c.shop_name ? `${c.shop_name} · ` : "";
+      return `<option value="${i}">${esc(where + c.title.slice(0, 20))}</option>`;
+    }))
+    .join("");
+}
+
 function renderCouponConfirm(d) {
   pendingCoupons = d;
   if (!d.coupons || !d.coupons.length) {
     $("vision-out").innerHTML = `<div class="card">△ 没有识别到清晰的券信息，换张图试试</div>`;
     return;
   }
-  const rows = d.coupons.map((c) => `<div class="group">
-      <span class="pill">${esc(c.type)}</span>
+  const candidates = bindingCandidates(d.platform);
+  const noOfferHint = candidates.length
+    ? ""
+    : `<div class="foot">⚠️ 没有可绑定的商品：拼多多多数商品不返回店铺名，所以<b>建议先搜索商品、再补录券</b>，
+       否则店铺券无法绑定、不会自动套用（平台券不受影响）。</div>`;
+  const rows = d.coupons.map((c, i) => `<div class="group" style="flex-wrap:wrap">
+      <span class="pill">${esc(COUPON_TYPE_LABELS[c.type] || c.type)}</span>
       <span class="price">满${esc(c.threshold)}减${esc(c.face_value)}</span>
       <span>${esc(c.scope || "")}</span>
       <span style="color:var(--sub);font-size:12px">${c.valid_until ? "至 " + esc(c.valid_until) : ""}｜置信 ${Number(c.confidence).toFixed(2)}</span>
+      <div style="flex-basis:100%">
+        <span style="color:var(--sub);font-size:12px">适用范围</span>
+        <select class="c-bind" data-idx="${i}">${bindingOptionsHTML(candidates)}</select>
+        <span class="c-warn" data-idx="${i}" style="color:var(--warn);font-size:12px"></span>
+      </div>
     </div>`).join("");
-  $("vision-out").innerHTML = `<div class="card"><b>券识别结果</b>（${esc(d.platform)}）——<span style="color:var(--warn)">确认后才会计入到手价</span>
-    ${rows}
+  $("vision-out").innerHTML = `<div class="card"><b>券识别结果</b>（${esc(PLATFORM_LABEL_BY_CODE[d.platform] || d.platform)}）——<span style="color:var(--warn)">确认后才会计入到手价</span>
+    ${rows}${noOfferHint}
     <div style="margin-top:10px"><button class="ghost" id="confirmCoupons">确认写入</button>
     <button class="ghost" id="discardCoupons">放弃</button></div></div>`;
-  $("confirmCoupons").onclick = async () => {
-    const resp = await fetch("/api/coupons", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(pendingCoupons),
+
+  const refreshWarnings = () => {
+    $("vision-out").querySelectorAll(".c-bind").forEach((select) => {
+      const coupon = pendingCoupons.coupons[Number(select.dataset.idx)];
+      const warn = $("vision-out").querySelector(`.c-warn[data-idx="${select.dataset.idx}"]`);
+      if (!warn) return;
+      if (coupon.type === "category" && !select.value) warn.textContent = "｜品类券需绑定商品才能确定品类，否则不会套用";
+      else if ((coupon.type === "shop" || coupon.type === "collect") && !select.value) warn.textContent = "｜店铺券需绑定店铺，否则不会套用";
+      else warn.textContent = "";
     });
-    const data = await readJson(resp);
-    if (!resp.ok) { $("vision-out").innerHTML = `<div class="card">写入失败：${esc(data.detail || "")}</div>`; return; }
-    $("vision-out").innerHTML = `<div class="card">✅ ${esc(data.note)}</div>`;
-    if ($("q").value.trim()) search();  // 自动重算当前查询
+  };
+  $("vision-out").querySelectorAll(".c-bind").forEach((select) => { select.onchange = refreshWarnings; });
+  refreshWarnings();
+
+  $("confirmCoupons").onclick = async () => {
+    // 从 DOM 重建 payload：把选中的绑定写回对应的券
+    const body = {
+      platform: pendingCoupons.platform,
+      coupons: pendingCoupons.coupons.map((c, i) => {
+        const select = $("vision-out").querySelector(`.c-bind[data-idx="${i}"]`);
+        const picked = select && select.value !== "" ? candidates[Number(select.value)] : null;
+        return {
+          ...c,
+          shop_id: (picked && picked.shop_id) || null,
+          shop_name: (picked && picked.shop_name) || null,
+          category_ids: (picked && picked.category_ids) || [],
+          bound_label: (picked && picked.title) || "",
+        };
+      }),
+    };
+    try {
+      const resp = await fetch("/api/coupons", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const data = await readJson(resp);
+      if (!resp.ok) { $("vision-out").innerHTML = `<div class="card">写入失败：${esc(detailText(data, "未知错误"))}</div>`; return; }
+      $("vision-out").innerHTML = `<div class="card">✅ ${esc(data.note)}</div>`;
+      pendingCoupons = null;
+      await loadCoupons();
+      if ($("q").value.trim()) search();  // 自动重算当前查询
+    } catch (err) {
+      $("vision-out").innerHTML = `<div class="card">写入失败：${esc(err.message)}</div>`;
+    }
   };
   $("discardCoupons").onclick = () => { $("vision-out").innerHTML = ""; pendingCoupons = null; };
 }
@@ -318,6 +396,138 @@ async function loadWatchlistStatus() {
 loadWatchlistStatus();
 const esc = (s) => { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; };
 
+// ============ 券面板 ============
+// 上半：我补录的券（看得见、删得掉——此前只有写入没有查看，补录完就消失了）
+// 下半：当前查询商品各自有哪些券可用（引导去 App 领券）
+let lastCoupons = [];
+let pendingDeleteKey = "";   // 行内二次点击确认用（项目里没有 confirm() 的先例）
+
+async function loadCoupons() {
+  try {
+    const data = await readJson(await fetch("/api/coupons"));
+    lastCoupons = data.coupons || [];
+  } catch (err) {
+    lastCoupons = [];   // 状态加载失败静默（同 loadWatchlistStatus 的口径）
+  }
+  renderCouponPanel();
+}
+
+function boundText(coupon) {
+  if (coupon.bound_label) return coupon.bound_label.slice(0, 22);
+  if (coupon.shop_name) return coupon.shop_name;
+  if (coupon.shop_id) return `店铺 #${coupon.shop_id}`;
+  if (coupon.category_ids && coupon.category_ids.length) return "按品类";
+  return "";
+}
+
+// 这张补录券在**本次查询**里生效了吗？——「我补录了券怎么没生效」要能在界面上找到答案，
+// 而不是静默丢弃。判定只看 payload 里已下发的券清单，不重复实现一遍范围规则。
+function appliedStatusHTML(coupon) {
+  const offers = (lastData && lastData.offers) || [];
+  if (!offers.length) return "";
+  let appliedCount = 0;
+  let reason = "";
+  for (const o of offers) {
+    for (const c of o.coupons || []) {
+      if (c.coupon_id !== coupon.coupon_id || c.source === "api") continue;
+      if (c.applied) appliedCount += 1;
+      else if (!reason) reason = c.reject_reason;
+    }
+  }
+  if (appliedCount) return `<span class="pill">本次已计入 ${appliedCount} 个商品</span>`;
+  if (reason) return `<span class="pill warn">本次未计入：${esc(reason)}</span>`;
+  return `<span class="pill warn">本次商品均不适用</span>`;
+}
+
+function couponRowHTML(coupon) {
+  const key = `${coupon.platform}\u0000${coupon.coupon_id}`;
+  const shopScoped = coupon.type === "shop" || coupon.type === "collect";
+  const catScoped = coupon.type === "category";
+  const bound = boundText(coupon);
+  const unbound = (shopScoped && !coupon.shop_id && !coupon.shop_name) || (catScoped && !(coupon.category_ids || []).length);
+  const binding = unbound
+    ? `<span class="pill warn">未绑定适用范围 · 不会自动套用</span>`
+    : bound ? `<span class="pill">绑定：${esc(bound)}</span>` : `<span class="pill">全平台</span>`;
+  const delBtn = pendingDeleteKey === key
+    ? `<button class="mini" data-del="${esc(key)}">确认删除</button><button class="mini" data-cancel="1">取消</button>`
+    : `<button class="mini" data-del="${esc(key)}">删除</button>`;
+  return `<div class="group">
+      <span class="pill">${esc(PLATFORM_LABEL_BY_CODE[coupon.platform] || coupon.platform)}</span>
+      <span class="pill">${esc(COUPON_TYPE_LABELS[coupon.type] || coupon.type)}</span>
+      <span class="price">满${esc(coupon.threshold)}减${esc(coupon.face_value)}</span>
+      <span>${esc(coupon.scope || "")}</span>
+      ${binding}
+      ${unbound ? "" : appliedStatusHTML(coupon)}
+      <span style="color:var(--sub);font-size:12px">${coupon.valid_until ? "至 " + esc(coupon.valid_until) : ""}</span>
+      ${delBtn}
+    </div>`;
+}
+
+function offerCouponsHTML() {
+  const offers = ((lastData && lastData.offers) || []).slice(0, 10);
+  if (!offers.length) {
+    return `<div class="foot">※ 先查询商品——这里会列出每个商品当前可用的券（含需要去 App 领取的）。</div>`;
+  }
+  return offers.map((o) => {
+    const lines = (o.coupons || []).map((c) => {
+      const status = c.applied
+        ? `<span class="pill">已计入到手价</span>`
+        : c.reject_reason ? `<span class="pill warn">未计入：${esc(c.reject_reason)}</span>`
+        : `<span class="pill">可领</span>`;
+      const mine = c.source !== "api" ? `<span class="pill warn">我补录的</span>` : "";
+      return `<div class="formula">· ${esc(c.label)} ${status} ${mine} ${c.scope ? esc(c.scope) : ""}</div>`;
+    }).join("");
+    return `<div class="group" style="flex-wrap:wrap">
+        <span class="pill">${esc(o.platform)}</span>
+        <span>${esc(o.title).slice(0, 30)}</span>
+        <span class="price">￥${esc(o.final_price)}</span>
+        <div style="flex-basis:100%">${lines || `<div class="formula">· 未发现公开券（去 App 看看有没有店铺券）</div>`}</div>
+      </div>`;
+  }).join("");
+}
+
+function renderCouponPanel() {
+  const container = $("coupons");
+  if (!container) return;
+  const mine = lastCoupons.length
+    ? lastCoupons.map(couponRowHTML).join("")
+    : `<div class="foot">还没有补录券：点上方「券截图补录」上传 → 确认 → 券会出现在这里。</div>`;
+  container.innerHTML = `<div class="card"><b>我的优惠券</b>（本机补录，删除即时生效）
+    ${mine}
+    <div class="foot" style="margin-top:8px"><b>当前商品可用的券</b></div>
+    ${offerCouponsHTML()}
+    <div class="foot">※ 只有店铺/品类匹配的补录券才会自动套用；拼多多多数商品不返回店铺名与店铺 id，
+      店铺券请在补录时从查询结果里挑商品来绑定。券信息来自平台公开数据，实际以结算页为准。</div></div>`;
+
+  container.querySelectorAll("[data-del]").forEach((button) => {
+    button.onclick = () => {
+      const key = button.dataset.del;
+      if (pendingDeleteKey !== key) { pendingDeleteKey = key; renderCouponPanel(); return; }
+      deleteCoupon(key);
+    };
+  });
+  container.querySelectorAll("[data-cancel]").forEach((button) => {
+    button.onclick = () => { pendingDeleteKey = ""; renderCouponPanel(); };
+  });
+}
+
+async function deleteCoupon(key) {
+  const [platform, couponId] = key.split("\u0000");
+  try {
+    const params = new URLSearchParams({ platform, coupon_id: couponId });
+    const data = await readJson(await fetch(`/api/coupons?${params}`, { method: "DELETE" }));
+    pendingDeleteKey = "";
+    await loadCoupons();
+    // 删券必须重算：不重算的话页面上还是含这张券的旧价
+    if ($("q").value.trim()) search();
+    return data;
+  } catch (err) {
+    pendingDeleteKey = "";
+    renderCouponPanel();
+  }
+}
+
+
 function sparkline(series) {
   const prices = series.map((p) => Number(p.price));
   const min = Math.min(...prices), max = Math.max(...prices);
@@ -363,6 +573,7 @@ function newSession() {
   $("out").classList.add("hidden");
   $("similar-out").innerHTML = "";
   lastData = null;
+  renderCouponPanel();   // 清了结果，下半部分（当前商品的券）也要跟着清
   $("q").focus();
 }
 
@@ -822,6 +1033,7 @@ function render(d) {
   $("out").classList.remove("hidden");
   $("out").querySelectorAll(".chip").forEach((element) => { element.onclick = onChip; });
   renderOffers();
+  renderCouponPanel();   // 下半部分依赖 lastData，有结果就要刷新
 }
 
 // —— 深链：?q=关键词&agent=0&session=xxx ——
@@ -849,6 +1061,10 @@ function applyDeepLink() {
 }
 
 applyDeepLink();
+
+// 放在脚本最末尾：loadCoupons → renderCouponPanel 会用到 `let lastCoupons` / `esc`，
+// 早于它们的声明调用会踩 TDZ（L396 的 loadWatchlistStatus() 是既有的侥幸，别学）。
+loadCoupons();
 </script>
 </body>
 </html>
