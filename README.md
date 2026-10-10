@@ -103,7 +103,12 @@ python -m priceradar.agent.pipeline "QCY N20 哪里买划算"          # 固定�
 python -m evaluation.run_eval             # 同款匹配评测
 python -m evaluation.agent_eval           # Agent 行为评测（离线回放，零花费）
 python -m priceradar.mcp_server           # MCP Server（stdio）
+python scripts/web_smoke.py               # 无头浏览器冒烟：真实渲染、检查工具是否报错
 ```
+
+> `web_smoke.py` 需要真实网络与本机装了 Edge/Chrome，**不进 CI**。它的价值在于覆盖
+> 「Web 路径 + 真工具 + 真模型」三者同时在场才复现的问题——已经靠它抓到过一次
+> 「只影响比价的设置把风险扫描弄坏了」，而当时单元测试、HTTP 层测试、CLI 全绿。
 
 需要 `.env`（模板见 `.env.example`）：拼多多开放平台 / 京东联盟 / 博查 / DeepSeek / DashScope 凭证。账号申请指引见 [docs/accounts-onboarding.md](docs/accounts-onboarding.md)。
 
