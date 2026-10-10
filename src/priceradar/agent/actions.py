@@ -467,6 +467,18 @@ ACTIONS: dict[str, Action] = {
 }
 
 
+def accepted_params(name: str, registry: dict[str, "Action"] | None = None) -> frozenset[str]:
+    """该工具接受的参数名（LLM 可见字段 + 白名单内部参数）。未知工具返回空集。
+
+    调用方用它来**过滤要补进工具调用的默认值**——不筛的话，`jd_channel` 这类
+    只有比价工具认的参数会被塞给 `scan_risk`，然后被白名单拒绝，整个工具就废了。
+    """
+    action = (registry or ACTIONS).get(name)
+    if action is None:
+        return frozenset()
+    return frozenset(action.params.model_fields) | action.internal_params
+
+
 def _parameters_schema(model: type[BaseModel]) -> dict:
     """pydantic 模型 → OpenAI 兼容的 parameters JSON Schema。"""
     schema = model.model_json_schema()
@@ -631,6 +643,7 @@ __all__ = [
     "HistoryRow",
     "PriceHistory",
     "SimilarResult",
+    "accepted_params",
     "apply_user_coupons",
     "check_price_history",
     "explain_pdd_error",

@@ -538,6 +538,45 @@ def test_tool_defaults_reach_the_tool_call(monkeypatch):
     assert calls[0][1]["jd_channel"] == -1
 
 
+def test_tool_defaults_do_not_leak_into_tools_that_reject_them(monkeypatch):
+    """回归：**只影响比价的设置不能把别的工具弄坏。**
+
+    `tool_defaults={"jd_channel": …}` 曾经被**无差别**塞进每个工具调用，于是
+    `scan_risk` 收到一个它不认的参数、被参数白名单拒绝，整个风险扫描报废——
+    模型只好说「工具一直报参数错误，重试也没用」，然后放弃。
+
+    ⚠️ 这个 bug **只有真的在浏览器里跑才看得到**：CLI 不传 `tool_defaults`，
+    所以命令行一路正常；这里故意走**真实的** `run_action`（不桩它），
+    才能覆盖到参数白名单那一层。
+    """
+    import priceradar.agent.actions as actions
+    from priceradar.risk import RiskSummary
+
+    monkeypatch.setattr(actions, "_llm_client", lambda: None)
+    monkeypatch.setattr(
+        actions,
+        "scan_with_env",
+        lambda product: RiskSummary(product=product, queries=["q"], items=[], note="ok", degraded=True),
+    )
+
+    _, client = make_agent(monkeypatch, call_tool("c1", "scan_risk", product="x"), answer("好"))
+    run = loop.run_agent("x", client=client, tool_defaults={"jd_channel": -1})
+
+    execution = run.steps[0].tool_calls[0]
+    assert execution.ok is True, execution.error
+    assert "jd_channel" not in execution.arguments
+
+
+def test_accepted_params_knows_each_tool(monkeypatch):
+    """默认值过滤的依据：`jd_channel` 属于比价，不属于风险扫描。"""
+    from priceradar.agent.actions import accepted_params
+
+    assert "jd_channel" in accepted_params("compare_prices")
+    assert "jd_channel" not in accepted_params("scan_risk")
+    assert "db_path" in accepted_params("check_price_history")   # 白名单内部参数
+    assert accepted_params("不存在的工具") == frozenset()
+
+
 def test_model_supplied_argument_wins_over_default(monkeypatch):
     """模型明确给了就听模型的——defaults 只补空缺。"""
     calls = patch_actions(monkeypatch, {"compare_prices": ok("compare_prices", make_result())})

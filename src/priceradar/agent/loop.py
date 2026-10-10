@@ -30,7 +30,14 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from priceradar.agent.actions import ACTIONS, _llm_client, compare_prices, openai_tools, run_action
+from priceradar.agent.actions import (
+    ACTIONS,
+    _llm_client,
+    accepted_params,
+    compare_prices,
+    openai_tools,
+    run_action,
+)
 from priceradar.agent.llm import ChatReply, DeepSeekClient, LlmError, Usage
 from priceradar.agent.pipeline import PipelineResult
 from priceradar.trace import Trace
@@ -214,8 +221,18 @@ def _execute(memo: dict, call, trace: Trace, defaults: dict | None = None) -> To
       想重试时会被缓存挡回去，恢复能力直接失效
     """
     # 用户设置（如 jd_channel）补进模型**没给**的参数——模型通常不会主动传它，
-    # 但 Web 上「京东频道=-1（关闭京东）」这类设置必须生效，否则界面上的开关是假的
-    arguments = {**defaults, **call.arguments} if defaults else dict(call.arguments)
+    # 但 Web 上「京东频道=-1（关闭京东）」这类设置必须生效，否则界面上的开关是假的。
+    #
+    # ⚠️ **必须按工具筛一遍**：不筛的话 `jd_channel` 会被塞给 `scan_risk`，
+    # 而它不在该工具的参数白名单里，于是整个风险扫描都被判为「参数错误」——一个
+    # 只影响比价的设置把别的工具全弄坏了。这个 bug 只有真的在浏览器里跑才看得到
+    #（CLI 不传 tool_defaults，所以一路正常）。
+    applicable = (
+        {key: value for key, value in defaults.items() if key in accepted_params(call.name)}
+        if defaults
+        else {}
+    )
+    arguments = {**applicable, **call.arguments}
     key = (call.name, _canonical(arguments))
     cached = memo.get(key)
     if cached is not None and (cached.ok or not cached.retryable):
