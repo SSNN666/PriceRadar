@@ -114,14 +114,17 @@
     <input id="couponInput" type="file" accept="image/*" hidden>
     <span id="snapStatus" class="snap-status"></span>
   </div>
-  <div id="drops"></div>
-  <div id="watchlist"></div>
-  <div id="vision-out"></div>
+  <!-- 查询结果紧贴搜索框：先把「你刚问的那件事」给出来，再放常驻的监控面板。
+       此前 #drops / #watchlist 排在前面，关注面板一长，Agent 进度与结果卡就被
+       挤到屏幕外——用户点了查询却看不到任何反应。 -->
   <div id="status" class="loading hidden">查询中（约 3-10 秒）…</div>
   <div id="error" class="error hidden"></div>
   <div id="agent-out"></div>
   <div id="out" class="hidden"></div>
   <div id="similar-out"></div>
+  <div id="drops"></div>
+  <div id="watchlist"></div>
+  <div id="vision-out"></div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -453,6 +456,15 @@ function runAgentStream(params) {
   });
 }
 
+// 成本精确到 9 位有效数字没有意义，读起来还吵。保留 3 位有效数字，
+// 但**绝不显示成 0**——单次查询本来就是千分之几元，抹成 0 比不显示更糟。
+function formatCost(raw) {
+  const value = Number(raw);
+  if (!isFinite(value) || value <= 0) return String(raw);
+  const text = value.toPrecision(3);
+  return text.includes("e") ? value.toFixed(6) : text;
+}
+
 function renderAgentAnswer(data) {
   const box = $("agentAnswer");
   if (!box) return;
@@ -467,7 +479,7 @@ function renderAgentAnswer(data) {
     bits.push(`token 入 ${usage.prompt_tokens}/出 ${usage.completion_tokens}`);
     if (usage.cache_hit_tokens !== undefined) bits.push(`缓存命中 ${Math.round((usage.cache_hit_rate || 0) * 100)}%`);
   }
-  if (usage.cost && usage.cost !== "0") bits.push(`≈￥${usage.cost}${usage.cost_is_estimated ? "（按次粗估）" : ""}`);
+  if (usage.cost && usage.cost !== "0") bits.push(`≈￥${formatCost(usage.cost)}${usage.cost_is_estimated ? "（按次粗估）" : ""}`);
   if (data.degraded) bits.push(`⚠️ 已降级：${data.stopped_by}`);
   box.innerHTML = `<div class="agent-meta">${esc(bits.join(" · "))}</div>
     <div class="agent-text">${esc(data.final_text || "（模型未给出文字答复）")}</div>`;
@@ -487,6 +499,7 @@ async function search() {
   if (searching) return;              // 上一次还没跑完，忽略这次提交
   searching = true;
   const useAgent = $("useAgent").checked;
+  syncUrl(q, useAgent);               // 地址栏跟着走，方便收藏/转发这一次查询
   $("go").disabled = true;
   $("error").classList.add("hidden");
   $("out").classList.add("hidden");
@@ -808,6 +821,32 @@ function render(d) {
   $("out").querySelectorAll(".chip").forEach((element) => { element.onclick = onChip; });
   renderOffers();
 }
+
+// —— 深链：?q=关键词&agent=0&session=xxx ——
+// 让一次查询可以被收藏/分享（比价结果本来就常要转给别人看），
+// 顺带让页面能被自动化工具直接打开到结果态（截图、回归截图都靠它）。
+function syncUrl(q, useAgent) {
+  try {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (!useAgent) params.set("agent", "0");
+    if (sessionId) params.set("session", sessionId);
+    const query = params.toString();
+    history.replaceState(null, "", query ? `?${query}` : location.pathname);
+  } catch { /* 某些上下文禁止改 history，不影响使用 */ }
+}
+
+function applyDeepLink() {
+  const params = new URLSearchParams(location.search);
+  const q = params.get("q");
+  if (params.get("session")) setSessionId(params.get("session"));
+  if (!q) return;
+  if (params.get("agent") === "0") $("useAgent").checked = false;
+  $("q").value = q;
+  search();
+}
+
+applyDeepLink();
 </script>
 </body>
 </html>
