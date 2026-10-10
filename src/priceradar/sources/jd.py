@@ -75,6 +75,16 @@ def _ms_to_date(value) -> date | None:
         return None
 
 
+def _category_ids(item: dict) -> list[str]:
+    """品类链（粗→细）[cid1, cid2, cid3]。实测 jingfen 10/10 覆盖。
+
+    京东给的是 `categoryInfo` 对象（含 cid1Name/cid2Name/cid3Name 供展示），
+    取 id 而不是名字——id 才是稳定的匹配依据。
+    """
+    info = item.get("categoryInfo") or {}
+    return [str(info[key]) for key in ("cid1", "cid2", "cid3") if info.get(key) not in (None, "")]
+
+
 def jingfen_item_to_offer(item: dict) -> Offer:
     """把京粉精选商品（goods.jingfen.query 响应项）映射为 Offer。"""
     item_id = str(item.get("itemId") or "")
@@ -101,7 +111,8 @@ def jingfen_item_to_offer(item: dict) -> Offer:
     )
     raw_brand = str(item.get("brandName") or "").strip()
     brand = raw_brand if raw_brand and raw_brand != "无品牌" and not raw_brand.isdigit() else None
-    shop_name = (item.get("shopInfo") or {}).get("shopName") or None
+    shop_info = item.get("shopInfo") or {}
+    shop_name = shop_info.get("shopName") or None
     return Offer(
         platform=Platform.JD,
         sku_id=item_id,
@@ -110,6 +121,11 @@ def jingfen_item_to_offer(item: dict) -> Offer:
         url=_normalize_url(item.get("materialUrl")),
         image_url=_first_image_url(item),
         shop_name=shop_name,
+        # 京东**有**稳定的店铺 id（实测 jingfen 10/10，如 154435483）——比按店名匹配更可靠。
+        # 注意 `tests/test_jd_source.py` 的手写 fixture 里 shopInfo 只有 shopName，
+        # 曾据此误判"京东无店铺 id"；真实接口字段多得多，以真实响应为准。
+        shop_id=str(shop_info.get("shopId") or "") or None,
+        category_ids=_category_ids(item),
         brand=brand,
         shop_kind=_jd_shop_kind(item.get("owner"), shop_name),
         coupons=coupons,

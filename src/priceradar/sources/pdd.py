@@ -109,6 +109,18 @@ def _seconds_to_date(value: object) -> date | None:
     return date.fromtimestamp(stamp) if stamp > 0 else None
 
 
+def _category_ids(item: dict) -> list[str]:
+    """品类链（粗→细）。实测 `cat_ids` 100% 覆盖（83/83 样本，如 [5752, 5826, 19146]）。
+
+    只认列表——字符串会被逐字符迭代成 ['5','7',...]，宁可不要也不给脏数据
+    （与 `unified_tags` 同一个坑）。
+    """
+    raw = item.get("cat_ids")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(value) for value in raw if value not in (None, "")]
+
+
 def goods_to_offer(item: dict) -> Offer:
     """把拼多多商品响应（搜索/推荐共用的商品结构）映射为 Offer。"""
     goods_id = str(item.get("goods_id") or "")
@@ -157,6 +169,12 @@ def goods_to_offer(item: dict) -> Offer:
         url=f"https://mobile.yangkeduo.com/goods.html?goods_id={goods_id}" if goods_id else None,
         image_url=str(item.get("goods_thumbnail_url") or item.get("goods_image_url") or "") or None,
         shop_name=item.get("mall_name") or None,
+        # ⚠️ 拼多多**没有店铺标识符**：mall_name 实测恒为空（快照库 874 条填充率 13%），
+        # 而 mall_id 连键都不存在（2026-10-10 实测 83 条搜索样本，0 命中）——
+        # docs/pdd-api-findings.md 曾写"mall_id 可用"，那是错的（已订正）。
+        # 结论：拼多多的店铺券**无法绑定到店铺**，只能诚实降级为不自动套用。
+        shop_id=None,
+        category_ids=_category_ids(item),
         shop_kind=_merchant_type_to_shop_kind(item.get("merchant_type")),
         brand=raw_brand or None,
         tags=tags,

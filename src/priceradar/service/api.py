@@ -75,12 +75,41 @@ async def _unexpected_error_handler(request, exc) -> JSONResponse:
 app.add_exception_handler(Exception, _unexpected_error_handler)
 
 
+def _coupon_payloads(offer: Offer, breakdown: PriceBreakdown) -> list[dict]:
+    """商品的券清单（含"这张算没算进去、没算的话为什么"）——供券面板下半部分展示。
+
+    `applied` 只看 `kind == "coupon"` 的条目：`applied`/`rejected` 里的 `source_id`
+    对促销和券是同一个命名空间，不按 kind 过滤会有假碰撞。
+    """
+    applied_ids = {item.source_id for item in breakdown.applied if item.kind == "coupon"}
+    rejected_reasons = {item.source_id: REASON_LABELS[item.reason] for item in breakdown.rejected}
+    return [
+        {
+            "coupon_id": coupon.coupon_id,
+            "type": coupon.type.value,
+            "label": coupon.label(),
+            "face_value": fmt_amount(coupon.face_value),
+            "threshold": fmt_amount(coupon.threshold),
+            "scope": coupon.scope_note,
+            "shop_name": coupon.shop_name or "",
+            "valid_until": coupon.valid_until.isoformat() if coupon.valid_until else "",
+            "source": coupon.source,  # api=平台公开券（可去 App 领）／screenshot=你补录的
+            "applied": coupon.coupon_id in applied_ids,
+            "reject_reason": rejected_reasons.get(coupon.coupon_id, ""),
+        }
+        for coupon in offer.coupons
+    ]
+
+
 def offer_payload(offer: Offer, breakdown: PriceBreakdown, *, group_count: int = 1, history=None) -> dict:
     """单个报价 → 前端可消费的 dict（`/api/search` 与 `/api/similar` 共用）。"""
     return {
         "platform": PLATFORM_LABELS[offer.platform],
         "title": offer.title,
         "shop": offer.shop_name or "",
+        "shop_id": offer.shop_id or "",
+        "category_ids": list(offer.category_ids),
+        "coupons": _coupon_payloads(offer, breakdown),
         "url": offer.url or "",
         "image_url": offer.image_url or "",
         "shop_kind": offer.shop_kind.value if offer.shop_kind else "",
@@ -776,6 +805,7 @@ async def api_vision(file: UploadFile = File(...), mode: str = "product") -> dic
 @app.post("/api/coupons")
 def api_confirm_coupons(extraction: CouponExtraction) -> dict:
     """用户确认后的券写入（§5.6：识别 → 用户确认 → 才入库；入库后查询自动并入重算）。"""
+    from priceradar.domain.models import CouponType
     from priceradar.user_store import connect_user_db, save_coupons
 
     coupons = to_offer_coupons(extraction)
@@ -786,11 +816,19 @@ def api_confirm_coupons(extraction: CouponExtraction) -> dict:
         stored = save_coupons(connection, extraction.platform, coupons)
     finally:
         connection.close()
-    return {
-        "stored": stored,
-        "platform": extraction.platform,
-        "note": f"已写入 {stored} 张用户券；下次查询将自动并入重算（明细含 [补录] 标记）",
-    }
+
+    # 写入成功 ≠ 会生效：店铺券/品类券必须有绑定依据才套用。这里如实说清楚，
+    # 否则用户会以为"补录了就一定算进到手价"。
+    shop_scoped = (CouponType.SHOP, CouponType.COLLECT)
+    unbound = sum(1 for c in coupons if c.type in shop_scoped and not (c.shop_id or c.shop_name))
+    unbound += sum(1 for c in coupons if c.type is CouponType.CATEGORY and not c.category_ids)
+    note = f"已写入 {stored} 张用户券；下次查询将自动并入重算（明细含 [补录] 标记）"
+    if unbound:
+        note += f"；其中 {unbound} 张未绑定适用范围，不会自动套用"
+    mismatched = [c for c in coupons if c.type is CouponType.PLATFORM and (c.shop_id or c.shop_name)]
+    if mismatched:
+        note += "；⚠️ 有券标为平台券却带了店铺信息——平台券会套用到全平台，请确认类型填对"
+    return {"stored": stored, "platform": extraction.platform, "note": note}
 
 
 @app.get("/api/coupons")
@@ -805,6 +843,32 @@ def api_list_coupons(platform: str | None = None) -> dict:
         return {"coupons": list_coupons(connection, platform)}
     finally:
         connection.close()
+
+
+@app.delete("/api/coupons")
+def api_delete_coupon(
+    platform: str = Query(..., min_length=1), coupon_id: str = Query(..., min_length=1)
+) -> dict:
+    """删除一张用户券（幂等：库里没有这张券返回 deleted=false，不 404）。
+
+    券的唯一键是 (platform, coupon_id)——表上就是这个 UNIQUE 约束。
+    """
+    from priceradar.user_store import DEFAULT_DB, connect_user_db, delete_coupon
+
+    # 不为了让 DELETE「成功」而凭空建库（同 GET 的做法）
+    if not Path(DEFAULT_DB).exists():
+        return {"deleted": False, "platform": platform, "coupon_id": coupon_id, "note": "本地还没有券记录"}
+    connection = connect_user_db()
+    try:
+        deleted = delete_coupon(connection, platform, coupon_id)
+    finally:
+        connection.close()
+    return {
+        "deleted": deleted,
+        "platform": platform,
+        "coupon_id": coupon_id,
+        "note": "已删除该券（重新查询后不再套用）" if deleted else "没有找到这张券（可能已被删除）",
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

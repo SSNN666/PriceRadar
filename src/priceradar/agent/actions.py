@@ -55,7 +55,13 @@ def merge_user_coupons(
     """在**已算好**的 breakdown 上并入用户补录券（无用户库/无券时原样返回、不重算）。
 
     刻意不重算：管线算价可能带 as_of 等参数，重算未必等价。
+
+    ⚠️ **必须过 `coupons_for_offer` 的适用范围过滤**——否则一张「A 店铺」的券会把
+    该平台所有商品都打折（2026-10-10 修掉的 bug，见 `coupon_scope.py`）。
+    过滤只针对用户补录券：`offer.coupons` 里平台 API 直接返回的券本来就适用于该商品。
+    返回的计数是**真正适用**的张数，不是"加载到的"张数。
     """
+    from priceradar.coupon_scope import coupons_for_offer
     from priceradar.user_store import DEFAULT_DB, connect_user_db, load_active_coupons
 
     if not Path(DEFAULT_DB).exists():
@@ -64,14 +70,18 @@ def merge_user_coupons(
     try:
         merged = 0
         updated: list[tuple[Offer, PriceBreakdown]] = []
+        by_platform: dict[str, list] = {}  # 每平台只查一次库（原本每个 offer 查一次）
         for offer, breakdown in breakdowns:
-            user_coupons = load_active_coupons(connection, offer.platform.value)
-            if not user_coupons:
+            platform = offer.platform.value
+            if platform not in by_platform:
+                by_platform[platform] = load_active_coupons(connection, platform)
+            applicable, _rejected = coupons_for_offer(by_platform[platform], offer)
+            if not applicable:
                 updated.append((offer, breakdown))
                 continue
-            merged_offer = offer.model_copy(update={"coupons": list(offer.coupons) + user_coupons})
+            merged_offer = offer.model_copy(update={"coupons": list(offer.coupons) + applicable})
             updated.append((merged_offer, compute_price(merged_offer)))
-            merged += len(user_coupons)
+            merged += len(applicable)
         return merged, updated
     finally:
         connection.close()

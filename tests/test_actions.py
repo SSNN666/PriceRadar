@@ -129,6 +129,70 @@ def test_apply_user_coupons_no_db_is_noop(monkeypatch, tmp_path):
     assert result.breakdowns[0][1].final_price == D("99")
 
 
+def test_shop_coupon_does_not_leak_to_other_shops(monkeypatch, tmp_path):
+    """回归：店铺券只对该店铺的商品生效（2026-10-10 实测到的 bug）。
+
+    原先 `load_active_coupons` 只按平台过滤，补录一张「A店铺」的券会把该平台
+    **所有**商品都打折——实测 B 店铺的耳机从 100 掉到 90。到手价虚低且界面上
+    看不出来，正是本项目要防的那类错。
+    """
+    use_user_db(
+        monkeypatch,
+        tmp_path,
+        [
+            Coupon(
+                coupon_id="shot-pdd-0",
+                type=CouponType.SHOP,
+                face_value=D("10"),
+                threshold=D("50"),
+                shop_id="888",
+                shop_name="A店铺",
+                source="screenshot",
+            )
+        ],
+    )
+    a = make_offer(sku="a", title="A店铺 保温杯", price="100").model_copy(
+        update={"shop_id": "888", "shop_name": "A店铺"}
+    )
+    b = make_offer(sku="b", title="B店铺 耳机", price="100").model_copy(
+        update={"shop_id": "999", "shop_name": "B店铺"}
+    )
+    c = make_offer(sku="c", title="来历不明 数据线", price="100")  # 无任何店铺标识
+
+    merged, breakdowns = actions.merge_user_coupons(
+        [(a, compute_price(a)), (b, compute_price(b)), (c, compute_price(c))]
+    )
+    assert merged == 1  # 计数是"真正适用"的张数，不是"加载到的"张数
+    assert breakdowns[0][1].final_price == D("90")    # A 店铺：券生效
+    assert breakdowns[1][1].final_price == D("100")   # B 店铺：**不再被打折**
+    assert breakdowns[2][1].final_price == D("100")   # 无店铺标识：诚实降级
+
+
+def test_category_coupon_matches_only_the_bound_category(monkeypatch, tmp_path):
+    """品类券按品类链的最细一级匹配——共享「手机」这一级不算匹配。"""
+    use_user_db(
+        monkeypatch,
+        tmp_path,
+        [
+            Coupon(
+                coupon_id="cat-1",
+                type=CouponType.CATEGORY,
+                face_value=D("10"),
+                threshold=D("50"),
+                category_ids=["5752", "5826", "19146"],
+                source="screenshot",
+            )
+        ],
+    )
+    same = make_offer(sku="a", price="100").model_copy(update={"category_ids": ["5752", "5826", "19146"]})
+    other = make_offer(sku="b", price="100").model_copy(update={"category_ids": ["5752", "5826", "99999"]})
+
+    merged, breakdowns = actions.merge_user_coupons([(same, compute_price(same)), (other, compute_price(other))])
+    assert merged == 1
+    assert breakdowns[0][1].final_price == D("90")
+    assert breakdowns[1][1].final_price == D("100")
+
+
 # ============================================================
 # 2. compare_prices：编排顺序
 # ============================================================
