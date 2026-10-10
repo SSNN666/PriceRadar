@@ -29,6 +29,14 @@ from priceradar.config import load_env
 
 API_URL = "https://api.deepseek.com/chat/completions"
 
+# ⚠️ 2026-10-10 实测：`deepseek-chat` **仍可用，但已不在 `/models` 返回列表里**
+# （列表只剩 deepseek-v4-pro 与 deepseek-flash）——属于随时可能下架的状态。
+# 故模型名走 `DEEPSEEK_MODEL` 环境变量，真下架时改 .env 即可，不必改代码。
+# 换模型不等于改个字符串：新模型会带 `reasoning_content`，且 **prompt 缓存命中率
+# （现 79-87%）必须重测**、`evaluation/agent_eval` 的录制回放要重录（花钱）。
+# 未重测前不要把默认值换掉。
+DEFAULT_MODEL = "deepseek-chat"
+
 
 class LlmError(RuntimeError):
     pass
@@ -134,7 +142,7 @@ class DeepSeekClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-chat",
+        model: str = DEFAULT_MODEL,
         transport: Callable[[dict], dict] | None = None,
     ) -> None:
         self.api_key = api_key
@@ -143,10 +151,11 @@ class DeepSeekClient:
 
     @classmethod
     def from_env(cls) -> "DeepSeekClient":
-        api_key = load_env("DEEPSEEK_API_KEY").get("DEEPSEEK_API_KEY", "")
+        env = load_env("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL")
+        api_key = env.get("DEEPSEEK_API_KEY", "")
         if not api_key:
             raise LlmError("未配置 DEEPSEEK_API_KEY（环境变量或 .env）")
-        return cls(api_key)
+        return cls(api_key, model=env.get("DEEPSEEK_MODEL") or DEFAULT_MODEL)
 
     def _default_transport(self, body: dict) -> dict:
         request = urllib.request.Request(
