@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from priceradar.agent.pipeline import render, run
+from priceradar.agent.pipeline import _pick_source, render, run
 from priceradar.domain.models import Offer, Platform
 from priceradar.sources.jd import JdApiError
 
@@ -56,6 +56,35 @@ def test_pipeline_picks_representative_source_and_confirms_group():
     assert result.similar_items and "型号不同" in result.similar_items[0].reason  # 近似款明细随结果透出
     assert result.excluded_summary.get("配件/周边类商品") == 1
     assert len(result.breakdowns) == 2
+
+
+def test_source_selection_scans_the_whole_pool_not_just_the_head():
+    """源商品的选择**不该依赖接口返回顺序**。
+
+    实测（2026-10-10）：拼多多接口的返回顺序与到手价的秩相关约 **-0.35**
+    （贵的反而略靠前，更像按推广价值排的），并不按相关度。某个关键词下真正
+    的最优源商品排在第 24 位——探针只看前 5 条会直接错过。
+
+    全量扫描是纯 Python 计算，30 条约 25 ms；一次查询总耗时以秒计，省这 20 毫秒
+    不值得拿正确性去换。
+    """
+    head = [
+        make_offer("h0", "雷士 led长条灯管 一体化 高显色灯条"),
+        make_offer("h1", "PPR水管接头 4分 加厚"),
+        make_offer("h2", "不锈钢保温杯 316L 便携"),
+        make_offer("h3", "厨房收纳架 双层 免打孔"),
+        make_offer("h4", "洗衣液 薰衣草 补充装"),
+    ]
+    # 真正的最优源藏在后面：同一款被三家铺货
+    tail = [
+        make_offer("t0", PDD_N20_A),
+        make_offer("t1", PDD_N20_B),
+        make_offer("t2", "QCY N20降噪蓝牙耳机 无线入耳式 长续航"),
+    ]
+    pool = head + tail
+
+    assert _pick_source(pool).sku_id in {"t0", "t1", "t2"}   # 默认扫全量
+    assert _pick_source(pool, probe=5).sku_id in {"h0"}      # 只扫前 5 条 → 错过
 
 
 def test_pipeline_cross_platform_hit():

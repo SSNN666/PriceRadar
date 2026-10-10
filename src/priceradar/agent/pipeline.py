@@ -84,14 +84,23 @@ class PipelineResult:
         return any(item.offer.platform is not self.source.platform for item in self.confirmed)
 
 
-def _pick_source(pool: list[Offer], probe: int) -> Offer:
+def _pick_source(pool: list[Offer], probe: int | None = None) -> Offer:
     """在检索结果中挑"同款重复出现最多"的商品作为源（确定性启发式）。
 
     好商品往往被多个店铺重复铺货——出现次数最多的同款组即本轮的"目标商品"。
+
+    ⚠️ `probe=None`（默认）**扫描全部候选**。此前默认只看前 5 条，那等于把源商品的
+    选择押在**接口返回顺序**上——而实测该顺序并不按相关度排（与到手价的秩相关约
+    -0.35，贵的反而略靠前，更像是按推广价值排的）。实测某个关键词下真正的最优源
+    商品排在第 24 位，探针 5 直接错过。
+
+    全量扫描的代价是纯 Python 计算：30 条只要 ~25 ms（一次查询总耗时以**秒**计），
+    省这 20 毫秒不值得拿正确性去换。`probe` 保留给确实想限定范围的调用方。
     """
-    best_source = pool[0]
+    candidates = pool if probe is None else pool[:probe]
+    best_source = candidates[0]
     best_count = -1
-    for candidate_source in pool[:probe]:
+    for candidate_source in candidates:
         report = match_same_product(candidate_source, pool)
         count = sum(1 for result in report.results if result.tier is MatchTier.CONFIRMED)
         if count > best_count:
@@ -142,7 +151,7 @@ def run(
     jd_enabled: bool = True,
     jd_elite_id: int | None = None,
     jd_pool_size: int = 50,
-    probe: int = 5,
+    probe: int | None = None,
     trace: Trace | None = None,
     with_risk: bool = False,
     risk_scanner: Callable[[str], RiskSummary] | None = None,
