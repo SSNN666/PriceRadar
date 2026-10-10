@@ -314,6 +314,9 @@ def render(result: PipelineResult) -> str:
                 lines.append(f"    观测最低：￥{view['lowest']}")
             if view.get("fake_discount"):
                 lines.append(f"    △ {view['fake_discount']}")
+            if view.get("coupon_withdrawn"):
+                # 换个记号：这不是"可疑信号"，是"促销窗口结束了"——语气不该一样
+                lines.append(f"    ◇ {view['coupon_withdrawn']}")
         lines.append("  ※ 基于自观测数据（非平台全历史）；样本不足时不出时机结论")
     if result.risk is not None:
         lines.append("")

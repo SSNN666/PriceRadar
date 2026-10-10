@@ -307,6 +307,7 @@ async function loadWatchlistStatus() {
             <span style="color:var(--sub);font-size:12px">已观测 ${w.observed_days} 天 ｜ ${esc(w.verdict)}</span>
             ${w.series && w.series.length > 1 ? sparkline(w.series) : ""}
             ${w.fake_discount ? `<span class="pill warn">△ 疑似先涨后降</span>` : ""}
+            ${w.coupon_withdrawn ? `<span class="pill">◇ 优惠已收回</span>` : ""}
           </div>`).join("")}
           <div class="foot">※ 基于自观测数据（非平台全历史）；样本 &lt;14 天不出时机结论</div>
           <div class="foot">※ 拼多多网页端<b>不显示价格</b>（平台限制，会提示「前往 App 查看」）——点开商品链接只是为了去买，
@@ -692,6 +693,7 @@ function offerRowHTML(o, i) {
         ${o.rejected.map((r) => `<div class="rejected">△ 未计入：${esc(r.label)}（${esc(r.reason)}）</div>`).join("")}
         ${o.history ? `<div class="meta" style="color:var(--good)">价格观测：已观测 ${o.history.observed_days} 天 ｜ ${esc(o.history.verdict)}${o.history.series && o.history.series.length > 1 ? "　" + sparkline(o.history.series) : ""}</div>` : ""}
         ${o.history && o.history.fake_discount ? `<div class="rejected">△ ${esc(o.history.fake_discount)}</div>` : ""}
+        ${o.history && o.history.coupon_withdrawn ? `<div class="formula">◇ ${esc(o.history.coupon_withdrawn)}</div>` : ""}
       </div>
       <div style="text-align:right;white-space:nowrap">
         <div class="price">￥${esc(o.final_price)}</div>

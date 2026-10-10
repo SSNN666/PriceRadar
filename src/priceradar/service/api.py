@@ -630,6 +630,7 @@ def _watchlist_overview(connection, limit: int = 8) -> list[dict]:
                 "verdict": view["verdict"],
                 "series": series,
                 "fake_discount": view.get("fake_discount"),
+                "coupon_withdrawn": view.get("coupon_withdrawn"),
             }
         )
     return overview

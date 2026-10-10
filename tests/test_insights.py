@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from priceradar.domain.models import Offer, Platform
+from priceradar.insights.history import PricePoint
 from priceradar.insights import (
     advise_timing,
     attach_history_insights,
@@ -18,9 +19,21 @@ from priceradar.jobs.snapshot import connect, record_offers
 D = Decimal
 
 
-def points_from(prices: list[str]) -> list[tuple[str, Decimal]]:
+def points_from(prices: list[str], list_prices: list[str] | None = None) -> list[PricePoint]:
+    """构造观测序列。
+
+    `list_prices` 省略时标价 = 到手价（**没有优惠**，最省事的默认）。
+    要构造「有优惠」或「优惠在缩水」的序列，就显式传标价。
+    """
     start = date(2026, 9, 1)
-    return [((start + timedelta(days=index)).isoformat(), D(price)) for index, price in enumerate(prices)]
+    return [
+        PricePoint(
+            (start + timedelta(days=index)).isoformat(),
+            D(list_prices[index]) if list_prices else D(price),
+            D(price),
+        )
+        for index, price in enumerate(prices)
+    ]
 
 
 # ---------- 时机建议 ----------
@@ -42,8 +55,8 @@ def test_advise_low_percentile_is_buy():
     advice = advise_timing(points_from(["100"] * 13 + ["80"]))
     assert advice.status == "ok"
     assert "观测低位" in advice.verdict
-    assert advice.lowest == (advice.lowest[0], D("80"))
-    assert advice.lowest[1] == D("80")
+    assert advice.lowest.final_price == D("80")   # PricePoint 带标价与到手价两个字段
+    assert advice.lowest.list_price == D("80")    # 本用例没构造优惠 → 标价 = 到手价
 
 
 def test_advise_high_percentile_is_wait():
@@ -69,6 +82,7 @@ def test_fake_discount_suspected():
     report = detect_fake_discount(points_from(["100"] * 7 + ["140"] * 6 + ["120"]))
     assert report.status == "suspected"
     assert "先涨后降" in report.detail and "140" in report.detail
+    assert report.driver == "list_price"
 
 
 def test_fake_discount_clean_flat():
@@ -80,6 +94,52 @@ def test_fake_discount_clean_normal_drop():
     # 正常降价：无涨价阶段
     report = detect_fake_discount(points_from(["120"] * 7 + ["110", "105", "100", "99", "98", "97", "95"]))
     assert report.status == "clean"
+
+
+# ---------- 区分「商家提价」与「优惠缩水」 ----------
+# 这两种情况让**到手价曲线长得一模一样**，只有标价能分开它们。
+# 对买家的含义相反：前者是套路该警惕，后者往往只是促销窗口结束。
+
+_COUPON_FINALS = ["70"] * 7 + ["100"] * 6 + ["90"]     # 基线 ￥70 → 峰值 ￥100 → 现价 ￥90
+
+
+def test_coupon_withdrawal_is_not_called_a_fake_discount():
+    """标价没动、只有优惠缩水 → **不是**先涨后降。"""
+    points = points_from(_COUPON_FINALS, list_prices=["100"] * 14)
+    report = detect_fake_discount(points)
+    assert report.status == "coupon_withdrawn"
+    assert report.driver == "coupon"
+    assert "不是商家提价" in report.detail
+    assert "优惠" in report.detail
+
+
+def test_same_curve_but_rising_list_price_is_a_fake_discount():
+    """**同样的到手价曲线**，标价跟着涨了 → 这才是商家提价再打折。"""
+    points = points_from(_COUPON_FINALS, list_prices=["70"] * 7 + ["100"] * 7)
+    report = detect_fake_discount(points)
+    assert report.status == "suspected"
+    assert report.driver == "list_price"
+
+
+def test_the_two_drivers_differ_only_by_list_price():
+    """把上面两条并排：曲线完全相同，唯一差别是标价。"""
+    same_finals = _COUPON_FINALS
+    coupon = detect_fake_discount(points_from(same_finals, list_prices=["100"] * 14))
+    merchant = detect_fake_discount(points_from(same_finals, list_prices=["70"] * 7 + ["100"] * 7))
+    assert coupon.status != merchant.status
+    assert coupon.driver != merchant.driver
+
+
+def test_price_point_markdown_is_list_minus_final():
+    point = PricePoint("2026-09-01", D("100"), D("70"))
+    assert point.markdown == D("30")
+    assert point.pair == ("2026-09-01", D("70"))
+
+
+def test_no_discount_means_list_equals_final():
+    points = points_from(["100"] * 14)
+    assert all(point.markdown == 0 for point in points)
+    assert detect_fake_discount(points).status == "clean"
 
 
 # ---------- 快照库读取与视图 ----------
