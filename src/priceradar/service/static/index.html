@@ -68,6 +68,21 @@
   .decision.d-watch .dtier { background:#fff4e0; color:var(--warn); }
   .decision.d-discourage .dtier { background:#fdecec; color:#c02b2b; }
   .dhead { font-size:15px; font-weight:600; }
+  /* Agent 面板：实时显示「正在调什么工具」，与 #out 分开——render() 会整块覆盖 #out，
+     往里面追加内容和它打架 */
+  .agent { border-left:4px solid var(--accent); }
+  .agent-line { margin:7px 0; font-size:13px; }
+  .agent-round { display:inline-block; font-size:11px; color:#fff; background:var(--accent); border-radius:999px; padding:1px 8px; margin-right:6px; }
+  .agent-tool { font-size:12px; padding:2px 0 2px 20px; color:var(--sub); }
+  .agent-tool.ok { color:var(--good); }
+  .agent-tool.bad { color:#c02b2b; }
+  .agent-tool .name { font-weight:600; }
+  .agent-answer { margin-top:12px; padding-top:12px; border-top:1px solid #eef1f5; }
+  .agent-meta { color:var(--sub); font-size:12px; }
+  .agent-text { white-space:pre-wrap; font-size:14px; margin-top:6px; }
+  .session-bar { display:flex; gap:8px; align-items:center; margin-top:8px; font-size:12px; color:var(--sub); }
+  .session-bar .dot { width:7px; height:7px; border-radius:50%; background:#c8cfd9; display:inline-block; margin-right:5px; }
+  .session-bar .dot.on { background:var(--good); }
 </style>
 </head>
 <body>
@@ -81,9 +96,15 @@
   </div>
   <div class="hint" id="qHint">粘贴拼多多链接可直接反查到那件商品，并自动扩展相似商品 —— <b>请原样粘贴</b>，手工删改参数（如 uin）会导致平台拒绝。</div>
   <div class="opts">
+    <label title="由 LLM 自主决定调用哪些工具，并把每一步实时推给页面。关闭则走固定管线。"><input id="useAgent" type="checkbox" checked> Agent 模式（自主调工具 + 实时进度）</label>
     <label><input id="useLlm" type="checkbox" checked> LLM 理解与总结</label>
     <label title="0=自动按品类选频道；-1=关闭京东侧">京东频道 <input id="jdCh" type="number" value="0" style="width:44px"></label>
-    <label><input id="useRisk" type="checkbox"> 风险扫描（约 ¥0.2/次）</label>
+    <label title="Agent 模式下由它自己判断要不要扫风险；这里只影响非 Agent 模式"><input id="useRisk" type="checkbox"> 风险扫描（约 ¥0.2/次）</label>
+  </div>
+  <div class="session-bar">
+    <span id="sessionState"><span class="dot"></span>新会话（Agent 模式下的追问会承接上文）</span>
+    <button id="newSession" class="ghost" title="清空当前会话上下文，下一次提问重新开始">新会话</button>
+    <button id="watchKeyword" class="ghost" title="把上一个查询的商品加进每日价格快照的关注清单，之后可对比历史价">帮我盯着降价</button>
   </div>
   <div class="toolbar">
     <button id="snap" class="ghost" title="按关注清单（data/watchlist.json）采集当日到手价；同日重复自动幂等跳过">采集今日快照</button>
@@ -93,13 +114,20 @@
     <input id="couponInput" type="file" accept="image/*" hidden>
     <span id="snapStatus" class="snap-status"></span>
   </div>
-  <div id="drops"></div>
-  <div id="watchlist"></div>
-  <div id="vision-out"></div>
+  <!-- 查询结果紧贴搜索框：先把「你刚问的那件事」给出来，再放常驻的监控面板。
+       此前 #drops / #watchlist 排在前面，关注面板一长，Agent 进度与结果卡就被
+       挤到屏幕外——用户点了查询却看不到任何反应。 -->
   <div id="status" class="loading hidden">查询中（约 3-10 秒）…</div>
   <div id="error" class="error hidden"></div>
+  <div id="agent-out"></div>
   <div id="out" class="hidden"></div>
   <div id="similar-out"></div>
+  <div id="drops"></div>
+  <div id="watchlist"></div>
+  <!-- 券面板：上半是你补录的券（可删），下半是当前商品可领的券。
+       独立容器——不能复用 #vision-out，否则与确认卡互相清空。 -->
+  <div id="coupons"></div>
+  <div id="vision-out"></div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -190,32 +218,107 @@ $("couponInput").onchange = async (event) => {
   event.target.value = "";
 };
 
+// 券型中文名（后端 type 是英文枚举）
+const COUPON_TYPE_LABELS = { shop: "店铺券", platform: "平台券", category: "品类券", member: "会员券", collect: "店铺收藏券" };
+// 券的平台代码 ↔ payload 里的中文标签
+const PLATFORM_LABEL_BY_CODE = { pdd: "拼多多", jd: "京东", taobao: "淘宝" };
+
+// 绑定候选：本次查询结果里去重后的商品（携带绑定键）。
+// 实测拼多多不返回店铺名也不返回店铺 id，券截图上的店名无处可比——
+// 所以绑定靠"用户挑一个商品、系统反查它的标识"，而不是让用户手输店名。
+function bindingCandidates(platformCode) {
+  const label = PLATFORM_LABEL_BY_CODE[platformCode] || "";
+  const offers = (lastData && lastData.offers) || [];
+  const seen = new Set();
+  const out = [];
+  for (const o of offers) {
+    if (label && o.platform !== label) continue;
+    const key = o.shop_id || o.shop || o.title;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ shop_id: o.shop_id || "", shop_name: o.shop || "", category_ids: o.category_ids || [], title: o.title || "" });
+  }
+  return out;
+}
+
+function bindingOptionsHTML(candidates) {
+  return [`<option value="">不绑定（这张券不会自动套用）</option>`]
+    .concat(candidates.map((c, i) => {
+      const where = c.shop_name ? `${c.shop_name} · ` : "";
+      return `<option value="${i}">${esc(where + c.title.slice(0, 20))}</option>`;
+    }))
+    .join("");
+}
+
 function renderCouponConfirm(d) {
   pendingCoupons = d;
   if (!d.coupons || !d.coupons.length) {
     $("vision-out").innerHTML = `<div class="card">△ 没有识别到清晰的券信息，换张图试试</div>`;
     return;
   }
-  const rows = d.coupons.map((c) => `<div class="group">
-      <span class="pill">${esc(c.type)}</span>
+  const candidates = bindingCandidates(d.platform);
+  const noOfferHint = candidates.length
+    ? ""
+    : `<div class="foot">⚠️ 没有可绑定的商品：拼多多多数商品不返回店铺名，所以<b>建议先搜索商品、再补录券</b>，
+       否则店铺券无法绑定、不会自动套用（平台券不受影响）。</div>`;
+  const rows = d.coupons.map((c, i) => `<div class="group" style="flex-wrap:wrap">
+      <span class="pill">${esc(COUPON_TYPE_LABELS[c.type] || c.type)}</span>
       <span class="price">满${esc(c.threshold)}减${esc(c.face_value)}</span>
       <span>${esc(c.scope || "")}</span>
       <span style="color:var(--sub);font-size:12px">${c.valid_until ? "至 " + esc(c.valid_until) : ""}｜置信 ${Number(c.confidence).toFixed(2)}</span>
+      <div style="flex-basis:100%">
+        <span style="color:var(--sub);font-size:12px">适用范围</span>
+        <select class="c-bind" data-idx="${i}">${bindingOptionsHTML(candidates)}</select>
+        <span class="c-warn" data-idx="${i}" style="color:var(--warn);font-size:12px"></span>
+      </div>
     </div>`).join("");
-  $("vision-out").innerHTML = `<div class="card"><b>券识别结果</b>（${esc(d.platform)}）——<span style="color:var(--warn)">确认后才会计入到手价</span>
-    ${rows}
+  $("vision-out").innerHTML = `<div class="card"><b>券识别结果</b>（${esc(PLATFORM_LABEL_BY_CODE[d.platform] || d.platform)}）——<span style="color:var(--warn)">确认后才会计入到手价</span>
+    ${rows}${noOfferHint}
     <div style="margin-top:10px"><button class="ghost" id="confirmCoupons">确认写入</button>
     <button class="ghost" id="discardCoupons">放弃</button></div></div>`;
-  $("confirmCoupons").onclick = async () => {
-    const resp = await fetch("/api/coupons", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(pendingCoupons),
+
+  const refreshWarnings = () => {
+    $("vision-out").querySelectorAll(".c-bind").forEach((select) => {
+      const coupon = pendingCoupons.coupons[Number(select.dataset.idx)];
+      const warn = $("vision-out").querySelector(`.c-warn[data-idx="${select.dataset.idx}"]`);
+      if (!warn) return;
+      if (coupon.type === "category" && !select.value) warn.textContent = "｜品类券需绑定商品才能确定品类，否则不会套用";
+      else if ((coupon.type === "shop" || coupon.type === "collect") && !select.value) warn.textContent = "｜店铺券需绑定店铺，否则不会套用";
+      else warn.textContent = "";
     });
-    const data = await readJson(resp);
-    if (!resp.ok) { $("vision-out").innerHTML = `<div class="card">写入失败：${esc(data.detail || "")}</div>`; return; }
-    $("vision-out").innerHTML = `<div class="card">✅ ${esc(data.note)}</div>`;
-    if ($("q").value.trim()) search();  // 自动重算当前查询
+  };
+  $("vision-out").querySelectorAll(".c-bind").forEach((select) => { select.onchange = refreshWarnings; });
+  refreshWarnings();
+
+  $("confirmCoupons").onclick = async () => {
+    // 从 DOM 重建 payload：把选中的绑定写回对应的券
+    const body = {
+      platform: pendingCoupons.platform,
+      coupons: pendingCoupons.coupons.map((c, i) => {
+        const select = $("vision-out").querySelector(`.c-bind[data-idx="${i}"]`);
+        const picked = select && select.value !== "" ? candidates[Number(select.value)] : null;
+        return {
+          ...c,
+          shop_id: (picked && picked.shop_id) || null,
+          shop_name: (picked && picked.shop_name) || null,
+          category_ids: (picked && picked.category_ids) || [],
+          bound_label: (picked && picked.title) || "",
+        };
+      }),
+    };
+    try {
+      const resp = await fetch("/api/coupons", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const data = await readJson(resp);
+      if (!resp.ok) { $("vision-out").innerHTML = `<div class="card">写入失败：${esc(detailText(data, "未知错误"))}</div>`; return; }
+      $("vision-out").innerHTML = `<div class="card">✅ ${esc(data.note)}</div>`;
+      pendingCoupons = null;
+      await loadCoupons();
+      if ($("q").value.trim()) search();  // 自动重算当前查询
+    } catch (err) {
+      $("vision-out").innerHTML = `<div class="card">写入失败：${esc(err.message)}</div>`;
+    }
   };
   $("discardCoupons").onclick = () => { $("vision-out").innerHTML = ""; pendingCoupons = null; };
 }
@@ -282,6 +385,7 @@ async function loadWatchlistStatus() {
             <span style="color:var(--sub);font-size:12px">已观测 ${w.observed_days} 天 ｜ ${esc(w.verdict)}</span>
             ${w.series && w.series.length > 1 ? sparkline(w.series) : ""}
             ${w.fake_discount ? `<span class="pill warn">△ 疑似先涨后降</span>` : ""}
+            ${w.coupon_withdrawn ? `<span class="pill">◇ 优惠已收回</span>` : ""}
           </div>`).join("")}
           <div class="foot">※ 基于自观测数据（非平台全历史）；样本 &lt;14 天不出时机结论</div>
           <div class="foot">※ 拼多多网页端<b>不显示价格</b>（平台限制，会提示「前往 App 查看」）——点开商品链接只是为了去买，
@@ -291,6 +395,138 @@ async function loadWatchlistStatus() {
 }
 loadWatchlistStatus();
 const esc = (s) => { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; };
+
+// ============ 券面板 ============
+// 上半：我补录的券（看得见、删得掉——此前只有写入没有查看，补录完就消失了）
+// 下半：当前查询商品各自有哪些券可用（引导去 App 领券）
+let lastCoupons = [];
+let pendingDeleteKey = "";   // 行内二次点击确认用（项目里没有 confirm() 的先例）
+
+async function loadCoupons() {
+  try {
+    const data = await readJson(await fetch("/api/coupons"));
+    lastCoupons = data.coupons || [];
+  } catch (err) {
+    lastCoupons = [];   // 状态加载失败静默（同 loadWatchlistStatus 的口径）
+  }
+  renderCouponPanel();
+}
+
+function boundText(coupon) {
+  if (coupon.bound_label) return coupon.bound_label.slice(0, 22);
+  if (coupon.shop_name) return coupon.shop_name;
+  if (coupon.shop_id) return `店铺 #${coupon.shop_id}`;
+  if (coupon.category_ids && coupon.category_ids.length) return "按品类";
+  return "";
+}
+
+// 这张补录券在**本次查询**里生效了吗？——「我补录了券怎么没生效」要能在界面上找到答案，
+// 而不是静默丢弃。判定只看 payload 里已下发的券清单，不重复实现一遍范围规则。
+function appliedStatusHTML(coupon) {
+  const offers = (lastData && lastData.offers) || [];
+  if (!offers.length) return "";
+  let appliedCount = 0;
+  let reason = "";
+  for (const o of offers) {
+    for (const c of o.coupons || []) {
+      if (c.coupon_id !== coupon.coupon_id || c.source === "api") continue;
+      if (c.applied) appliedCount += 1;
+      else if (!reason) reason = c.reject_reason;
+    }
+  }
+  if (appliedCount) return `<span class="pill">本次已计入 ${appliedCount} 个商品</span>`;
+  if (reason) return `<span class="pill warn">本次未计入：${esc(reason)}</span>`;
+  return `<span class="pill warn">本次商品均不适用</span>`;
+}
+
+function couponRowHTML(coupon) {
+  const key = `${coupon.platform}\u0000${coupon.coupon_id}`;
+  const shopScoped = coupon.type === "shop" || coupon.type === "collect";
+  const catScoped = coupon.type === "category";
+  const bound = boundText(coupon);
+  const unbound = (shopScoped && !coupon.shop_id && !coupon.shop_name) || (catScoped && !(coupon.category_ids || []).length);
+  const binding = unbound
+    ? `<span class="pill warn">未绑定适用范围 · 不会自动套用</span>`
+    : bound ? `<span class="pill">绑定：${esc(bound)}</span>` : `<span class="pill">全平台</span>`;
+  const delBtn = pendingDeleteKey === key
+    ? `<button class="mini" data-del="${esc(key)}">确认删除</button><button class="mini" data-cancel="1">取消</button>`
+    : `<button class="mini" data-del="${esc(key)}">删除</button>`;
+  return `<div class="group">
+      <span class="pill">${esc(PLATFORM_LABEL_BY_CODE[coupon.platform] || coupon.platform)}</span>
+      <span class="pill">${esc(COUPON_TYPE_LABELS[coupon.type] || coupon.type)}</span>
+      <span class="price">满${esc(coupon.threshold)}减${esc(coupon.face_value)}</span>
+      <span>${esc(coupon.scope || "")}</span>
+      ${binding}
+      ${unbound ? "" : appliedStatusHTML(coupon)}
+      <span style="color:var(--sub);font-size:12px">${coupon.valid_until ? "至 " + esc(coupon.valid_until) : ""}</span>
+      ${delBtn}
+    </div>`;
+}
+
+function offerCouponsHTML() {
+  const offers = ((lastData && lastData.offers) || []).slice(0, 10);
+  if (!offers.length) {
+    return `<div class="foot">※ 先查询商品——这里会列出每个商品当前可用的券（含需要去 App 领取的）。</div>`;
+  }
+  return offers.map((o) => {
+    const lines = (o.coupons || []).map((c) => {
+      const status = c.applied
+        ? `<span class="pill">已计入到手价</span>`
+        : c.reject_reason ? `<span class="pill warn">未计入：${esc(c.reject_reason)}</span>`
+        : `<span class="pill">可领</span>`;
+      const mine = c.source !== "api" ? `<span class="pill warn">我补录的</span>` : "";
+      return `<div class="formula">· ${esc(c.label)} ${status} ${mine} ${c.scope ? esc(c.scope) : ""}</div>`;
+    }).join("");
+    return `<div class="group" style="flex-wrap:wrap">
+        <span class="pill">${esc(o.platform)}</span>
+        <span>${esc(o.title).slice(0, 30)}</span>
+        <span class="price">￥${esc(o.final_price)}</span>
+        <div style="flex-basis:100%">${lines || `<div class="formula">· 未发现公开券（去 App 看看有没有店铺券）</div>`}</div>
+      </div>`;
+  }).join("");
+}
+
+function renderCouponPanel() {
+  const container = $("coupons");
+  if (!container) return;
+  const mine = lastCoupons.length
+    ? lastCoupons.map(couponRowHTML).join("")
+    : `<div class="foot">还没有补录券：点上方「券截图补录」上传 → 确认 → 券会出现在这里。</div>`;
+  container.innerHTML = `<div class="card"><b>我的优惠券</b>（本机补录，删除即时生效）
+    ${mine}
+    <div class="foot" style="margin-top:8px"><b>当前商品可用的券</b></div>
+    ${offerCouponsHTML()}
+    <div class="foot">※ 只有店铺/品类匹配的补录券才会自动套用；拼多多多数商品不返回店铺名与店铺 id，
+      店铺券请在补录时从查询结果里挑商品来绑定。券信息来自平台公开数据，实际以结算页为准。</div></div>`;
+
+  container.querySelectorAll("[data-del]").forEach((button) => {
+    button.onclick = () => {
+      const key = button.dataset.del;
+      if (pendingDeleteKey !== key) { pendingDeleteKey = key; renderCouponPanel(); return; }
+      deleteCoupon(key);
+    };
+  });
+  container.querySelectorAll("[data-cancel]").forEach((button) => {
+    button.onclick = () => { pendingDeleteKey = ""; renderCouponPanel(); };
+  });
+}
+
+async function deleteCoupon(key) {
+  const [platform, couponId] = key.split("\u0000");
+  try {
+    const params = new URLSearchParams({ platform, coupon_id: couponId });
+    const data = await readJson(await fetch(`/api/coupons?${params}`, { method: "DELETE" }));
+    pendingDeleteKey = "";
+    await loadCoupons();
+    // 删券必须重算：不重算的话页面上还是含这张券的旧价
+    if ($("q").value.trim()) search();
+    return data;
+  } catch (err) {
+    pendingDeleteKey = "";
+    renderCouponPanel();
+  }
+}
+
 
 function sparkline(series) {
   const prices = series.map((p) => Number(p.price));
@@ -304,27 +540,211 @@ function sparkline(series) {
   return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="vertical-align:middle"><polyline points="${pts}" fill="none" stroke="#0a6cff" stroke-width="1.6"/></svg>`;
 }
 
+// —— Agent 模式：SSE 实时进度 ——
+// 面板挂在 #agent-out（**不是 #out**）：render() 会整块覆盖 #out 的 innerHTML，
+// 往里面追加进度会和它打架。沿用 #vision-out / #similar-out 的既有先例。
+const TOOL_LABELS = { compare_prices: "跨平台比价", find_similar: "找相似商品", scan_risk: "风险扫描", check_price_history: "价格观测" };
+let agentSource = null;
+
+// 会话 ID 存 localStorage：刷新页面后还能接着上一轮问（会话本身在服务端库里）
+const SESSION_KEY = "priceradar_session";
+let sessionId = "";
+try { sessionId = localStorage.getItem(SESSION_KEY) || ""; } catch { sessionId = ""; }
+
+function setSessionId(id) {
+  sessionId = id || "";
+  try { sessionId ? localStorage.setItem(SESSION_KEY, sessionId) : localStorage.removeItem(SESSION_KEY); } catch { /* 隐私模式下 localStorage 可能不可用 */ }
+  renderSessionState();
+}
+
+function renderSessionState(text) {
+  const box = $("sessionState");
+  if (!box) return;
+  if (text) { box.innerHTML = `<span class="dot on"></span>${esc(text)}`; return; }
+  box.innerHTML = sessionId
+    ? `<span class="dot on"></span>进行中的会话 ${esc(sessionId.slice(0, 8))} —— 追问会承接上文`
+    : `<span class="dot"></span>新会话（Agent 模式下的追问会承接上文）`;
+}
+
+function newSession() {
+  setSessionId("");
+  $("agent-out").innerHTML = "";
+  $("out").innerHTML = "";
+  $("out").classList.add("hidden");
+  $("similar-out").innerHTML = "";
+  lastData = null;
+  renderCouponPanel();   // 清了结果，下半部分（当前商品的券）也要跟着清
+  $("q").focus();
+}
+
+// 后端的 detail 有两种形状：我们抛的 HTTPException 是字符串，
+// pydantic 校验失败（422）是对象数组。直接 String() 会得到 "[object Object]"。
+function detailText(data, fallback) {
+  const detail = data && data.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((item) => (item && item.msg) || "").filter(Boolean);
+    if (parts.length) return parts.join("；");
+  }
+  return fallback;
+}
+
+// 「帮我盯着降价」：把上一轮的商品名加进每日快照的关注清单。
+// PRD §4.2 承诺过这个动作，但此前没有接口——点了只能是个死胡同。
+async function watchKeyword() {
+  const keyword = ((lastData && lastData.keyword) || $("q").value.trim()).trim();
+  if (!keyword) { renderSessionState("先查一个商品，再点「帮我盯着降价」"); return; }
+  if (/^https?:\/\//i.test(keyword)) {
+    // 链接查询的关键词就是链接本身（extract_keyword 会原样透传），拿它去关注没有意义：
+    // 既超出接口的 80 字上限，日后每日快照还会把整条 URL 当关键词去搜。
+    renderSessionState("这次查的是商品链接，没有可关注的关键词——先用商品名搜一次再点。");
+    return;
+  }
+  try {
+    const resp = await fetch("/api/watchlist", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keyword }),
+    });
+    const data = await readJson(resp);
+    if (!resp.ok) throw new Error(detailText(data, "加入关注失败"));
+    renderSessionState(data.note);
+  } catch (err) {
+    renderSessionState("加入关注失败：" + err.message);
+  }
+}
+
+function agentPanelHTML() {
+  return `<div class="card agent"><b>Agent 正在工作…</b><div id="agentTrace"></div>
+    <div id="agentAnswer" class="agent-answer hidden"></div></div>`;
+}
+
+function renderAgentEvent(event) {
+  const trace = $("agentTrace");
+  if (!trace) return;
+  let html = "";
+  if (event.type === "step") {
+    html = `<div class="agent-line"><span class="agent-round">第 ${event.index + 1} 轮</span>${esc(event.content || "")}</div>`;
+  } else if (event.type === "tool") {
+    const label = TOOL_LABELS[event.name] || event.name;
+    const memo = event.from_memo ? "（复用本次结果，未重复调用）" : "";
+    html = `<div class="agent-tool ${event.ok ? "ok" : "bad"}">${event.ok ? "✓" : "✗"} <span class="name">${esc(label)}</span>${esc(memo)}</div>`;
+  } else if (event.type === "degraded") {
+    html = `<div class="agent-line">△ ${esc(event.reason || "")}</div>`;
+  } else if (event.type === "notice") {
+    html = `<div class="agent-line">△ ${esc(event.message || "")}</div>`;
+  }
+  if (html) trace.insertAdjacentHTML("beforeend", html);
+}
+
+// ⚠️ EventSource 在**服务端正常关流**后也会当成"断线"，约 3 秒后自动重发同一个 GET
+// ——同一次查询会完整跑第二遍（拼多多账号限流是已知事故）。所以收到 final / error
+// 必须显式 close()。连接层 error 事件没有 data、业务错误事件有，用这个区分。
+function runAgentStream(params) {
+  return new Promise((resolve, reject) => {
+    if (agentSource) { agentSource.close(); agentSource = null; }
+    const source = new EventSource("/api/agent/stream?" + params);
+    agentSource = source;
+    let settled = false;
+    const done = () => { settled = true; source.close(); agentSource = null; };
+
+    ["step", "tool", "degraded", "notice"].forEach((name) => {
+      source.addEventListener(name, (e) => renderAgentEvent(JSON.parse(e.data)));
+    });
+    source.addEventListener("session", (e) => setSessionId(JSON.parse(e.data).session_id));
+    source.addEventListener("final", (e) => {
+      const data = JSON.parse(e.data);
+      if (data.session_id) setSessionId(data.session_id);
+      done();
+      resolve(data);
+    });
+    source.addEventListener("error", (e) => {
+      if (settled) return;
+      done();
+      let message = "与服务端的连接中断（未收到最终结果）";
+      if (e.data) {
+        try { message = JSON.parse(e.data).message || message; } catch { /* 保持默认文案 */ }
+      }
+      reject(new Error(message));
+    });
+  });
+}
+
+// 成本精确到 9 位有效数字没有意义，读起来还吵。保留 3 位有效数字，
+// 但**绝不显示成 0**——单次查询本来就是千分之几元，抹成 0 比不显示更糟。
+function formatCost(raw) {
+  const value = Number(raw);
+  if (!isFinite(value) || value <= 0) return String(raw);
+  const text = value.toPrecision(3);
+  return text.includes("e") ? value.toFixed(6) : text;
+}
+
+function renderAgentAnswer(data) {
+  const box = $("agentAnswer");
+  if (!box) return;
+  const tools = (data.tools || []).length
+    ? data.tools.map((n) => TOOL_LABELS[n] || n).join(" → ")
+    : "（未调用工具）";
+  const bits = [`${data.rounds} 轮`, tools];
+  const usage = data.usage || {};
+  // 把成本与缓存命中率摆出来：这两项是「Agent 花不花钱」的直接答案，
+  // 藏进日志就等于没计量（缓存命中与未命中单价差 30-50 倍）
+  if (usage.prompt_tokens) {
+    bits.push(`token 入 ${usage.prompt_tokens}/出 ${usage.completion_tokens}`);
+    if (usage.cache_hit_tokens !== undefined) bits.push(`缓存命中 ${Math.round((usage.cache_hit_rate || 0) * 100)}%`);
+  }
+  if (usage.cost && usage.cost !== "0") bits.push(`≈￥${formatCost(usage.cost)}${usage.cost_is_estimated ? "（按次粗估）" : ""}`);
+  if (data.degraded) bits.push(`⚠️ 已降级：${data.stopped_by}`);
+  box.innerHTML = `<div class="agent-meta">${esc(bits.join(" · "))}</div>
+    <div class="agent-text">${esc(data.final_text || "（模型未给出文字答复）")}</div>`;
+  box.classList.remove("hidden");
+}
+
+// ⚠️ 必须防重入。第二次 search() 会 close() 掉第一次的 EventSource，
+// 而它那个 promise 只由 final/error 事件来 settle——连接一关就永远不 settle，
+// 于是第一次查询被静默遗弃（不渲染、不报错），服务端却照跑完并**把同一个问题
+// 又存成一轮会话**：重复的历史 + 重复的检索与模型花费。
+// 回车键连按（或按键自动重复）很容易触发，所以在这里挡，而不是只靠按钮禁用。
+let searching = false;
+
 async function search() {
   const q = $("q").value.trim();
   if (!q) return;
+  if (searching) return;              // 上一次还没跑完，忽略这次提交
+  searching = true;
+  const useAgent = $("useAgent").checked;
+  syncUrl(q, useAgent);               // 地址栏跟着走，方便收藏/转发这一次查询
   $("go").disabled = true;
-  $("status").classList.remove("hidden");
   $("error").classList.add("hidden");
   $("out").classList.add("hidden");
+  $("agent-out").innerHTML = "";
+  // Agent 模式下面板自己就是进度指示，不再叠一行"查询中"
+  $("status").classList.toggle("hidden", useAgent);
   try {
     const params = new URLSearchParams({ q, jd_channel: $("jdCh").value || "0", llm: $("useLlm").checked, risk: $("useRisk").checked });
-    const resp = await fetch("/api/search?" + params);
-    const data = await readJson(resp);
-    if (!resp.ok) throw new Error(data.detail || "查询失败");
-    render(data);
+    if (useAgent && sessionId) params.set("session_id", sessionId);   // 带上会话 → 承接上文
+    if (useAgent) {
+      $("agent-out").innerHTML = agentPanelHTML();
+      const data = await runAgentStream(params);
+      renderAgentAnswer(data);
+      if (data.payload) render(data.payload);
+    } else {
+      const resp = await fetch("/api/search?" + params);
+      const data = await readJson(resp);
+      if (!resp.ok) throw new Error(data.detail || "查询失败");
+      render(data);
+    }
   } catch (err) {
     $("error").textContent = "出错了：" + err.message;
     $("error").classList.remove("hidden");
   } finally {
+    searching = false;
     $("go").disabled = false;
     $("status").classList.add("hidden");
   }
 }
+
+$("newSession").onclick = newSession;
+$("watchKeyword").onclick = watchKeyword;
+renderSessionState();   // 初始化会话状态行（sessionId 已在上面从 localStorage 读回）
 
 let lastData = null;
 const filters = { platform: "all", jdPremium: false, minRate: 0, minSales: 0, excludeSuspicious: false };
@@ -484,6 +904,7 @@ function offerRowHTML(o, i) {
         ${o.rejected.map((r) => `<div class="rejected">△ 未计入：${esc(r.label)}（${esc(r.reason)}）</div>`).join("")}
         ${o.history ? `<div class="meta" style="color:var(--good)">价格观测：已观测 ${o.history.observed_days} 天 ｜ ${esc(o.history.verdict)}${o.history.series && o.history.series.length > 1 ? "　" + sparkline(o.history.series) : ""}</div>` : ""}
         ${o.history && o.history.fake_discount ? `<div class="rejected">△ ${esc(o.history.fake_discount)}</div>` : ""}
+        ${o.history && o.history.coupon_withdrawn ? `<div class="formula">◇ ${esc(o.history.coupon_withdrawn)}</div>` : ""}
       </div>
       <div style="text-align:right;white-space:nowrap">
         <div class="price">￥${esc(o.final_price)}</div>
@@ -612,7 +1033,38 @@ function render(d) {
   $("out").classList.remove("hidden");
   $("out").querySelectorAll(".chip").forEach((element) => { element.onclick = onChip; });
   renderOffers();
+  renderCouponPanel();   // 下半部分依赖 lastData，有结果就要刷新
 }
+
+// —— 深链：?q=关键词&agent=0&session=xxx ——
+// 让一次查询可以被收藏/分享（比价结果本来就常要转给别人看），
+// 顺带让页面能被自动化工具直接打开到结果态（截图、回归截图都靠它）。
+function syncUrl(q, useAgent) {
+  try {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (!useAgent) params.set("agent", "0");
+    if (sessionId) params.set("session", sessionId);
+    const query = params.toString();
+    history.replaceState(null, "", query ? `?${query}` : location.pathname);
+  } catch { /* 某些上下文禁止改 history，不影响使用 */ }
+}
+
+function applyDeepLink() {
+  const params = new URLSearchParams(location.search);
+  const q = params.get("q");
+  if (params.get("session")) setSessionId(params.get("session"));
+  if (!q) return;
+  if (params.get("agent") === "0") $("useAgent").checked = false;
+  $("q").value = q;
+  search();
+}
+
+applyDeepLink();
+
+// 放在脚本最末尾：loadCoupons → renderCouponPanel 会用到 `let lastCoupons` / `esc`，
+// 早于它们的声明调用会踩 TDZ（L396 的 loadWatchlistStatus() 是既有的侥幸，别学）。
+loadCoupons();
 </script>
 </body>
 </html>

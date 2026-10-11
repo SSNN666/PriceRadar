@@ -87,7 +87,13 @@ _CLUSTER_SYSTEM = (
 )
 
 
-def cluster_issues(summary: RiskSummary, client: DeepSeekClient | None = None, *, max_items: int = 40) -> RiskSummary:
+def cluster_issues(
+    summary: RiskSummary,
+    client: DeepSeekClient | None = None,
+    *,
+    max_items: int = 40,
+    usage_sink=None,
+) -> RiskSummary:
     """LLM 把检索结果聚类为风险主题；未启用/失败时保持降级状态（不编造）。"""
     if client is None or not summary.items:
         return summary

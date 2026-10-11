@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 import priceradar.service.api as api_module
 from priceradar.agent.pipeline import ConfirmedItem, OfferGroup, PipelineResult
-from priceradar.domain.models import Offer, Platform, ShopKind, Signals
+from priceradar.domain.models import Coupon, CouponType, Offer, Platform, ShopKind, Signals
 from priceradar.engine.pricing import compute_price
 from priceradar.trace import Trace
 
@@ -56,6 +56,37 @@ def test_to_payload_shape():
     assert payload["candidates"]["similar"] == 3
     assert payload["trace"].startswith("[trace ")
     assert payload["cross_platform_hit"] is False
+
+
+def test_payload_coupon_list_says_which_ones_counted_and_why_not():
+    """券面板下半部分靠这个：每张券都要能回答"算没算进去、没算的话为什么"。"""
+    counted = Coupon(coupon_id="c1", type=CouponType.PLATFORM, face_value=D("10"), threshold=D("50"))
+    too_high = Coupon(coupon_id="c2", type=CouponType.PLATFORM, face_value=D("10"), threshold=D("500"))
+    offer = Offer(
+        platform=Platform.PDD, sku_id="a", title="商品", list_price=D("99"), shop_name="A店", coupons=[counted, too_high]
+    )
+    payload = api_module.offer_payload(offer, compute_price(offer))
+    by_id = {item["coupon_id"]: item for item in payload["coupons"]}
+    assert by_id["c1"]["applied"] is True
+    assert by_id["c1"]["reject_reason"] == ""
+    assert by_id["c2"]["applied"] is False
+    assert by_id["c2"]["reject_reason"]          # 门槛没到，必须给出原因
+    assert by_id["c1"]["source"] == "api"        # 前端据此区分"可去 App 领"与"你补录的"
+
+
+def test_payload_carries_shop_id_and_category_ids():
+    """绑定的依据要从 payload 里下发，确认卡才能反查出候选商品的标识。"""
+    offer = Offer(
+        platform=Platform.JD,
+        sku_id="j1",
+        title="大米",
+        list_price=D("99"),
+        shop_id="154435483",
+        category_ids=["34884", "34911", "34919"],
+    )
+    payload = api_module.offer_payload(offer, compute_price(offer))
+    assert payload["shop_id"] == "154435483"
+    assert payload["category_ids"] == ["34884", "34911", "34919"]
 
 
 def test_to_payload_carries_signals_and_shop_kind():
@@ -237,8 +268,15 @@ def test_offers_payload_exposes_goods_sign():
     assert "goods_sign" in payload["offers"][0]
 
 
-def test_merge_user_coupons_does_not_recompute_without_db():
-    """无用户库时必须原样返回（不重算）——管线算价可能带 as_of 等参数，重算未必等价。"""
+def test_merge_user_coupons_does_not_recompute_without_db(tmp_path, monkeypatch):
+    """无用户库时必须原样返回（不重算）——管线算价可能带 as_of 等参数，重算未必等价。
+
+    必须显式打桩 DEFAULT_DB：不打桩时读的是本机 `data/user_data.db`，
+    本机一旦有补录券（手动测试留下的），「无库」前提就不成立。
+    """
+    import priceradar.user_store as user_store
+
+    monkeypatch.setattr(user_store, "DEFAULT_DB", tmp_path / "none.db")
     offer = Offer(platform=Platform.PDD, sku_id="x", title="t", list_price=Decimal("10"))
     original = compute_price(offer)
     merged, breakdowns = api_module.merge_user_coupons([(offer, original)])
@@ -455,6 +493,55 @@ def test_coupon_confirm_and_list_routes(tmp_path, monkeypatch):
     assert len(listing) == 1
     assert listing[0]["platform"] == "jd"
     assert Decimal(str(listing[0]["face_value"])) == Decimal("50")
+
+
+def test_coupon_delete_route_is_idempotent(tmp_path, monkeypatch):
+    import priceradar.user_store as user_store
+
+    monkeypatch.setattr(user_store, "DEFAULT_DB", tmp_path / "user.db")
+    client = TestClient(api_module.app)
+    client.post(
+        "/api/coupons",
+        json={"platform": "jd", "coupons": [{"type": "platform", "face_value": 5, "threshold": 0}]},
+    )
+    assert len(client.get("/api/coupons").json()["coupons"]) == 1
+
+    resp = client.delete("/api/coupons", params={"platform": "jd", "coupon_id": "shot-jd-0"})
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert client.get("/api/coupons").json()["coupons"] == []
+
+    # 再删一次：幂等，不 404（照 /api/watchlist 与 /api/sessions 的既有约定）
+    again = client.delete("/api/coupons", params={"platform": "jd", "coupon_id": "shot-jd-0"})
+    assert again.status_code == 200
+    assert again.json()["deleted"] is False
+
+
+def test_coupon_delete_without_db_file_does_not_create_one(tmp_path, monkeypatch):
+    """库里本来就没东西时，DELETE 不该为了"成功"而凭空建一个库出来。"""
+    import priceradar.user_store as user_store
+
+    missing = tmp_path / "nope.db"
+    monkeypatch.setattr(user_store, "DEFAULT_DB", missing)
+    resp = TestClient(api_module.app).delete(
+        "/api/coupons", params={"platform": "jd", "coupon_id": "x"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is False
+    assert not missing.exists()
+
+
+def test_unbound_shop_coupon_is_reported_in_the_note(tmp_path, monkeypatch):
+    """写入成功 ≠ 会生效——没绑定的店铺券必须当场说清楚，否则用户以为补录了就一定算。"""
+    import priceradar.user_store as user_store
+
+    monkeypatch.setattr(user_store, "DEFAULT_DB", tmp_path / "user.db")
+    resp = TestClient(api_module.app).post(
+        "/api/coupons",
+        json={"platform": "pdd", "coupons": [{"type": "shop", "face_value": 10, "threshold": 50}]},
+    )
+    assert resp.json()["stored"] == 1
+    assert "未绑定适用范围" in resp.json()["note"]
 
 
 def test_snapshot_route_returns_summary(monkeypatch):

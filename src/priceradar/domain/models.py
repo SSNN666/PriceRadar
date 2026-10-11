@@ -88,6 +88,16 @@ class Coupon(BaseModel):
     valid_until: date | None = None
     source: str = Field(default="api", description="来源：api / manual / screenshot")
     confidence: float = Field(default=1.0, ge=0, le=1, description="来源置信度（截图补录时 < 1）")
+    # —— 适用范围绑定（补录券专用）——
+    # ⚠️ 刻意**不复用 scope_note**：那是展示文本，拿它当判定依据正是"店铺券打到别家店"
+    # 那个 bug 的同一类错误。判定只看下面这三个字段。
+    shop_id: str | None = Field(default=None, description="绑定的店铺 id（京东 shopId；拼多多无此标识符，恒 None）")
+    shop_name: str | None = Field(default=None, description="绑定的店铺名（京东店铺名兜底与展示；拼多多不返回店名）")
+    category_ids: list[str] = Field(
+        default_factory=list,
+        description="绑定的品类链（粗→细）：拼多多 cat_ids / 京东 [cid1,cid2,cid3]。品类券按**最细一级**匹配",
+    )
+    bound_label: str = Field(default="", description="绑定来源的人类可读说明（如所选商品的标题），仅供展示")
 
     def label(self) -> str:
         base = _COUPON_TYPE_LABELS[self.type]
@@ -138,7 +148,16 @@ class Offer(BaseModel):
     url: str | None = None
     image_url: str | None = Field(default=None, description="商品主图 URL（展示用）")
     shop_name: str | None = None
+    shop_id: str | None = Field(
+        default=None,
+        description="平台店铺 id（京东 shopInfo.shopId）。⚠️ 拼多多**没有**这个标识符——"
+        "实测 pdd.ddk.goods.search 的响应里连 mall_id 这个键都不存在，故拼多多恒为 None",
+    )
     shop_kind: ShopKind | None = None
+    category_ids: list[str] = Field(
+        default_factory=list,
+        description="结构化品类链（粗→细）：拼多多 cat_ids / 京东 [cid1,cid2,cid3]（两者实测均 100% 覆盖）",
+    )
     brand: str | None = Field(default=None, description="平台提供的结构化品牌（供匹配，缺失为 None）")
     tags: list[str] = Field(default_factory=list, description="平台保障标签（正品险/假一赔十等）")
     signals: Signals | None = Field(default=None, description="质量/热度信号（缺失为 None，不猜）")

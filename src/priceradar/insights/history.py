@@ -20,7 +20,29 @@ FAKE_RISE_RATIO = 1.15      # 先涨：近期峰值 ≥ 前期基线 × 该比�
 FAKE_DROP_RATIO = 0.90      # 后降：现价 ≤ 峰值 × 该比例
 _RECENT_WINDOW = 7          # 近 7 天为"近期"，其前为"基线期"
 
-PricePoint = tuple[str, Decimal]
+@dataclass(frozen=True)
+class PricePoint:
+    """一天的观测点。
+
+    **标价与到手价必须分开记**——只看到手价的话，「商家提价再打折」与
+    「平台/店铺把优惠收回去了」长得一模一样，而这两件事对买家的含义相反：
+    前者是套路该警惕，后者往往只是促销窗口结束、等下一轮就行。
+    两者都让到手价曲线往上走，光看一条曲线分不出来。
+    """
+
+    day: str
+    list_price: Decimal
+    final_price: Decimal
+
+    @property
+    def markdown(self) -> Decimal:
+        """优惠额（标价 − 到手价）。它缩水 = 券到期/收回，不等于商家提价。"""
+        return self.list_price - self.final_price
+
+    @property
+    def pair(self) -> tuple[str, Decimal]:
+        """兼容旧格式 `(日期, 到手价)`。"""
+        return (self.day, self.final_price)
 
 
 @dataclass
@@ -35,17 +57,25 @@ class TimingAdvice:
 
 @dataclass
 class FakeDiscountReport:
-    status: str                      # "insufficient" | "clean" | "suspected"
+    status: str                      # "insufficient" | "clean" | "suspected" | "coupon_withdrawn"
     detail: str
+    driver: str = ""                 # "list_price"（商家提价）| "coupon"（优惠缩水）
 
 
 def load_history(connection: sqlite3.Connection, platform: str, sku_id: str) -> list[PricePoint]:
-    """读取某商品的观测历史（按日期升序）。"""
+    """读取某商品的观测历史（按日期升序）。
+
+    取标价也取到手价——`list_price` / `total_discount` 两列一直都写在库里，
+    只是以前从没被读过，于是「谁在动」这件事无从判断。
+    """
     rows = connection.execute(
-        "SELECT captured_date, final_price FROM price_snapshots WHERE platform = ? AND sku_id = ? ORDER BY captured_date",
+        """
+        SELECT captured_date, list_price, final_price FROM price_snapshots
+        WHERE platform = ? AND sku_id = ? ORDER BY captured_date
+        """,
         (platform, sku_id),
     ).fetchall()
-    return [(row[0], Decimal(row[1])) for row in rows]
+    return [PricePoint(row[0], Decimal(row[1]), Decimal(row[2])) for row in rows]
 
 
 def advise_timing(points: list[PricePoint], current: Decimal | None = None, min_days: int = MIN_OBSERVED_DAYS) -> TimingAdvice:
@@ -56,17 +86,17 @@ def advise_timing(points: list[PricePoint], current: Decimal | None = None, min_
     if days < min_days:
         return TimingAdvice(days, "insufficient", "数据积累中", note=f"已观测 {days} 天（{days}/{min_days}），暂不出时机结论")
 
-    prices = [price for _, price in points]
+    prices = [point.final_price for point in points]
     current = current if current is not None else prices[-1]
     percentile = sum(1 for price in prices if price <= current) / days
-    lowest_day, lowest_price = min(points, key=lambda pair: pair[1])
+    lowest = min(points, key=lambda point: point.final_price)
     if percentile <= 0.25:
         verdict = f"当前处于观测低位（第 {percentile:.0%} 分位），可考虑入手"
     elif percentile >= 0.75:
         verdict = f"当前处于观测高位（第 {percentile:.0%} 分位），可观望或等大促"
     else:
         verdict = f"价格处于观测中位（第 {percentile:.0%} 分位），按需购买"
-    return TimingAdvice(days, "ok", verdict, percentile, (lowest_day, lowest_price), note=f"基于自观测 {days} 天数据（非全历史）")
+    return TimingAdvice(days, "ok", verdict, percentile, lowest, note=f"基于自观测 {days} 天数据（非全历史）")
 
 
 def detect_fake_discount(
@@ -75,21 +105,46 @@ def detect_fake_discount(
     rise_ratio: float = FAKE_RISE_RATIO,
     drop_ratio: float = FAKE_DROP_RATIO,
 ) -> FakeDiscountReport:
-    """先涨后降检测：近 7 天峰值 ≥ 基线期最低价 × 升幅 且 现价 ≤ 峰值 × 降幅 → 疑似。"""
+    """先涨后降检测——**并区分是谁在动**。
+
+    形态成立（近期峰值明显高于基线、现价又回落）之后，看标价有没有真的涨：
+
+    - **标价涨了** → 商家提价再打折，是套路，值得警惕（`suspected`）
+    - **标价没涨，只是优惠缩了** → 券到期/收回，是促销窗口结束，
+      **不是套路**（`coupon_withdrawn`）；对买家的动作也不同——等下一轮券，
+      而不是"警惕这家店"
+
+    以前只看到手价一条曲线，这两种情况都会被写成「先涨后降」，措辞是错的。
+    """
     if len(points) < min_days:
         return FakeDiscountReport("insufficient", f"已观测 {len(points)} 天（不足 {min_days} 天），暂无法检测")
     earlier, recent = points[:-_RECENT_WINDOW], points[-_RECENT_WINDOW:]
-    baseline_day, baseline = min(earlier, key=lambda pair: pair[1])
-    peak_day, peak = max(recent, key=lambda pair: pair[1])
-    current = points[-1][1]
-    rise_threshold = baseline * Decimal(str(rise_ratio))
-    drop_threshold = peak * Decimal(str(drop_ratio))
-    if peak >= rise_threshold and current <= drop_threshold:
+    baseline = min(earlier, key=lambda point: point.final_price)
+    peak = max(recent, key=lambda point: point.final_price)
+    current = points[-1].final_price
+    rise_threshold = baseline.final_price * Decimal(str(rise_ratio))
+    drop_threshold = peak.final_price * Decimal(str(drop_ratio))
+    if peak.final_price < rise_threshold or current > drop_threshold:
+        return FakeDiscountReport("clean", "观测期内未检测到「先涨后降」特征")
+
+    list_rose = peak.list_price > baseline.list_price
+    if not list_rose:
+        lost = peak.markdown - baseline.markdown
         return FakeDiscountReport(
-            "suspected",
-            f"疑似先涨后降：{baseline_day} ￥{fmt_amount(baseline)} → {peak_day} 涨至 ￥{fmt_amount(peak)} → 现价 ￥{fmt_amount(current)}",
+            "coupon_withdrawn",
+            f"到手价回升来自**优惠缩水**（不是商家提价）：标价一直是 ￥{fmt_amount(baseline.list_price)} 没动，"
+            f"优惠从 ￥{fmt_amount(baseline.markdown)} 缩到 ￥{fmt_amount(peak.markdown)}"
+            f"（少了 ￥{fmt_amount(lost)}），到手价 {baseline.day} ￥{fmt_amount(baseline.final_price)} → "
+            f"{peak.day} ￥{fmt_amount(peak.final_price)}。更可能是促销券到期或收回，可以等下一轮。",
+            driver="coupon",
         )
-    return FakeDiscountReport("clean", "观测期内未检测到「先涨后降」特征")
+    return FakeDiscountReport(
+        "suspected",
+        f"疑似先涨后降：标价 {baseline.day} ￥{fmt_amount(baseline.list_price)} → "
+        f"{peak.day} 涨至 ￥{fmt_amount(peak.list_price)}（到手 ￥{fmt_amount(baseline.final_price)} → "
+        f"￥{fmt_amount(peak.final_price)}）→ 现价 ￥{fmt_amount(current)}",
+        driver="list_price",
+    )
 
 
 def sku_history_view(
@@ -109,12 +164,19 @@ def sku_history_view(
         "note": advice.note,
     }
     if points:
-        view["series"] = [{"date": day, "price": str(price)} for day, price in points[-30:]]
+        # 序列里同时带标价与优惠额：前端可以据此把"商家调价"和"优惠变动"分开看
+        view["series"] = [
+            {"date": point.day, "price": str(point.final_price), "list_price": str(point.list_price)}
+            for point in points[-30:]
+        ]
     if advice.lowest is not None:
-        view["lowest"] = f"{fmt_amount(advice.lowest[1])}（{advice.lowest[0]}）"
+        view["lowest"] = f"{fmt_amount(advice.lowest.final_price)}（{advice.lowest.day}）"
     fake = detect_fake_discount(points, min_days)
     if fake.status == "suspected":
         view["fake_discount"] = fake.detail
+    elif fake.status == "coupon_withdrawn":
+        # 单独一个键：它不是"可疑信号"，是"促销窗口结束了"，前端该用不同的语气展示
+        view["coupon_withdrawn"] = fake.detail
     return view
 
 

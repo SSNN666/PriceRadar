@@ -45,7 +45,9 @@ def fallback_keyword(text: str) -> str:
     return result or text.strip()
 
 
-def extract_keyword(text: str, client: DeepSeekClient | None = None) -> tuple[str, str]:
+def extract_keyword(
+    text: str, client: DeepSeekClient | None = None, *, usage_sink=None
+) -> tuple[str, str]:
     """从自然语言中提取检索关键词。返回 (keyword, method)，method ∈ {"link", "llm", "rule"}。
 
     **链接短路优先**：用户粘的是拼多多商品链接时，**原样透传**给检索层
@@ -57,7 +59,7 @@ def extract_keyword(text: str, client: DeepSeekClient | None = None) -> tuple[st
         return link, "link"
     if client is not None:
         try:
-            parsed = client.complete(_EXTRACT_SYSTEM, text, json_schema=ExtractedQuery)
+            parsed = client.complete(_EXTRACT_SYSTEM, text, json_schema=ExtractedQuery, usage_sink=usage_sink)
             keyword = parsed.keyword.strip() if isinstance(parsed, ExtractedQuery) else ""
             if keyword:
                 return keyword, "llm"
@@ -106,11 +108,13 @@ def fallback_summary(result: PipelineResult) -> str:
     return text
 
 
-def compose_summary(result: PipelineResult, client: DeepSeekClient | None = None) -> tuple[str, str]:
+def compose_summary(
+    result: PipelineResult, client: DeepSeekClient | None = None, *, usage_sink=None
+) -> tuple[str, str]:
     """生成报告导语。返回 (text, method)，method ∈ {"llm", "rule"}。"""
     if client is not None:
         try:
-            text = client.complete(_SUMMARY_SYSTEM, _fact_sheet(result))
+            text = client.complete(_SUMMARY_SYSTEM, _fact_sheet(result), usage_sink=usage_sink)
             cleaned = str(text).strip()
             if cleaned:
                 return cleaned, "llm"

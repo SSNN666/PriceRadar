@@ -23,6 +23,33 @@ def fake_response(content: str) -> dict:
     return {"choices": [{"message": {"content": content}}]}
 
 
+# ---------- 模型名（会被平台下架，故走配置而非硬编码）----------
+
+def test_default_model_is_deepseek_chat():
+    """2026-10-10 实测：`deepseek-chat` 仍可用，但**已不在 `/models` 列表里**。
+
+    默认值暂时不动（换模型要重测 prompt 缓存命中率 + 重录 agent_eval）。
+    这条测试钉住现状——真要换，得连着改这里与 llm.py 的注释。
+    """
+    assert DeepSeekClient("k").model == "deepseek-chat"
+
+
+def test_model_can_be_overridden_by_env(monkeypatch):
+    monkeypatch.setattr(
+        "priceradar.agent.llm.load_env",
+        lambda *names: {"DEEPSEEK_API_KEY": "k", "DEEPSEEK_MODEL": "deepseek-v4-pro"},
+    )
+    assert DeepSeekClient.from_env().model == "deepseek-v4-pro"
+
+
+def test_blank_model_env_falls_back_to_default(monkeypatch):
+    monkeypatch.setattr(
+        "priceradar.agent.llm.load_env",
+        lambda *names: {"DEEPSEEK_API_KEY": "k", "DEEPSEEK_MODEL": ""},
+    )
+    assert DeepSeekClient.from_env().model == "deepseek-chat"
+
+
 class ScriptedTransport:
     """按脚本依次返回响应；记录全部请求 body。"""
 

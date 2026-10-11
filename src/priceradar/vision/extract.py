@@ -45,12 +45,19 @@ PRODUCT_PROMPT = (
 
 
 class CouponFields(BaseModel):
-    type: Literal["shop", "platform", "category", "member"]
+    type: Literal["shop", "platform", "category", "member", "collect"]
     face_value: Decimal = Field(ge=0, description="面额（数字，不带单位）")
     threshold: Decimal = Field(default=Decimal("0"), ge=0, description="满减门槛（无门槛填 0）")
     scope: str = Field(default="", description="适用范围描述")
     valid_until: str | None = Field(default=None, description="有效期（YYYY-MM-DD）或 null")
     confidence: float = Field(default=0.5, ge=0, le=1)
+    # —— 适用范围绑定（由**确认卡**填入，不是 VLM 读出来的）——
+    # 实测拼多多不返回店铺名也不返回店铺 id，券截图上的店名无处可比；
+    # 所以绑定信息来自"用户从本次查询结果里挑了一个商品"，系统反查那个商品的标识。
+    shop_id: str | None = Field(default=None, description="绑定店铺 id（京东 shopId；拼多多无此标识）")
+    shop_name: str | None = Field(default=None, description="绑定店铺名（拼多多不返回店名，故多半为空）")
+    category_ids: list[str] = Field(default_factory=list, description="绑定品类链（粗→细），品类券用")
+    bound_label: str = Field(default="", description="绑定的来源商品标题（仅供展示）")
 
 
 class CouponExtraction(BaseModel):
@@ -73,6 +80,7 @@ _COUPON_TYPE_MAP = {
     "platform": CouponType.PLATFORM,
     "category": CouponType.CATEGORY,
     "member": CouponType.MEMBER,
+    "collect": CouponType.COLLECT,
 }
 
 
@@ -124,6 +132,10 @@ def to_offer_coupons(extraction: CouponExtraction) -> list[Coupon]:
                 valid_until=valid_until,
                 source="screenshot",
                 confidence=item.confidence,
+                shop_id=(item.shop_id or "").strip() or None,
+                shop_name=(item.shop_name or "").strip() or None,
+                category_ids=[str(value) for value in item.category_ids if value not in (None, "")],
+                bound_label=item.bound_label,
             )
         )
     return coupons

@@ -21,9 +21,30 @@ from priceradar.config import load_env
 
 API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
+# DashScope **会下架旧模型名**：2026-10-10 实测 `qwen-vl-max` / `qwen-vl-plus` 已从
+# 兼容端点的模型列表消失，调用直接 404 `model_not_found`（识图与券识别一起失效）。
+# 故模型名走 `DASHSCOPE_VL_MODEL` 环境变量，换代时改配置即可，不必改代码。
+# 可用列表：GET /compatible-mode/v1/models（需要 key）。
+DEFAULT_MODEL = "qwen3-vl-plus"
+
+_MODEL_NOT_FOUND_HINT = (
+    "模型不存在——DashScope 会下架旧模型名。"
+    "可用 DASHSCOPE_VL_MODEL 环境变量（或 .env）指定当前模型；"
+    "当前已知可用：qwen3-vl-plus（通用识图）、qwen-vl-ocr（纯 OCR）；"
+    "完整列表：GET https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+)
+
 
 class VisionError(RuntimeError):
     pass
+
+
+def _format_http_error(code: int, body: str) -> str:
+    """把 HTTP 错误转成人话；模型下架是最常见的一种，单独给出处方。"""
+    text = f"HTTP {code}: {body[:200]}"
+    if code == 404 and "model_not_found" in body:
+        return f"{text}\n{_MODEL_NOT_FOUND_HINT}"
+    return text
 
 
 def to_data_url(image_bytes: bytes, media_type: str = "image/jpeg") -> str:
@@ -34,17 +55,18 @@ def to_data_url(image_bytes: bytes, media_type: str = "image/jpeg") -> str:
 class QwenVlClient:
     """transport 可注入（测试离线化）：callable(body: dict) -> 响应 dict。"""
 
-    def __init__(self, api_key: str, model: str = "qwen-vl-max", transport: Callable[[dict], dict] | None = None) -> None:
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL, transport: Callable[[dict], dict] | None = None) -> None:
         self.api_key = api_key
         self.model = model
         self._transport = transport or self._default_transport
 
     @classmethod
     def from_env(cls) -> "QwenVlClient":
-        api_key = load_env("DASHSCOPE_API_KEY").get("DASHSCOPE_API_KEY", "")
+        env = load_env("DASHSCOPE_API_KEY", "DASHSCOPE_VL_MODEL")
+        api_key = env.get("DASHSCOPE_API_KEY", "")
         if not api_key:
             raise VisionError("未配置 DASHSCOPE_API_KEY（环境变量或 .env；阿里云百炼控制台申请）")
-        return cls(api_key)
+        return cls(api_key, model=env.get("DASHSCOPE_VL_MODEL") or DEFAULT_MODEL)
 
     def _default_transport(self, body: dict) -> dict:
         request = urllib.request.Request(
@@ -57,7 +79,7 @@ class QwenVlClient:
             with urllib.request.urlopen(request, timeout=60) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
-            raise VisionError(f"HTTP {error.code}: {error.read().decode('utf-8', 'replace')[:200]}") from error
+            raise VisionError(_format_http_error(error.code, error.read().decode("utf-8", "replace"))) from error
         except urllib.error.URLError as error:
             raise VisionError(f"网络错误：{error.reason}") from error
 

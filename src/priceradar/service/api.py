@@ -3,30 +3,36 @@
 - GET /            ：单页界面（输入 → 同款组 + 到手价对比卡）
 - GET /api/search  ：查询接口（q / jd_channel / llm），返回结构化 JSON
 
-设计：服务层只做"参数 → 管线 → 序列化"，全部业务在 agent/pipeline；
+设计：**服务层只做 HTTP 与序列化**——业务编排在 `agent/actions`（与 MCP Server、
+Agent 循环共用同一份实现），这里不再自己拼流程。
 LLM 默认启用（有 key 时），失败自动确定性兜底。
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import urllib.error
 from datetime import date
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Iterator
 
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
-from priceradar.agent.llm import DeepSeekClient, LlmError
-from priceradar.agent.llm_nodes import compose_summary, extract_keyword
-from priceradar.agent.pipeline import PipelineResult, run
+from priceradar.agent import actions
+from priceradar.agent.actions import compare_prices, explain_pdd_error
+from priceradar.agent.loop import run_agent
+from priceradar.agent.pipeline import PipelineResult
 from priceradar.domain.models import CERTIFIED_SHOP_KINDS, SHOP_KIND_LABELS, Offer
 from priceradar.engine.pricing import PriceBreakdown
 from priceradar.formatting import fmt_amount
 from priceradar.insights import assess_quality, campaign_context, decide, price_drops
 from priceradar.report import PLATFORM_LABELS, REASON_LABELS
-from priceradar.risk import cluster_issues
 from priceradar.sources.pdd import PddApiError
+from priceradar.trace import Trace
 from priceradar.vision import CouponExtraction, to_offer_coupons
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -69,12 +75,41 @@ async def _unexpected_error_handler(request, exc) -> JSONResponse:
 app.add_exception_handler(Exception, _unexpected_error_handler)
 
 
+def _coupon_payloads(offer: Offer, breakdown: PriceBreakdown) -> list[dict]:
+    """商品的券清单（含"这张算没算进去、没算的话为什么"）——供券面板下半部分展示。
+
+    `applied` 只看 `kind == "coupon"` 的条目：`applied`/`rejected` 里的 `source_id`
+    对促销和券是同一个命名空间，不按 kind 过滤会有假碰撞。
+    """
+    applied_ids = {item.source_id for item in breakdown.applied if item.kind == "coupon"}
+    rejected_reasons = {item.source_id: REASON_LABELS[item.reason] for item in breakdown.rejected}
+    return [
+        {
+            "coupon_id": coupon.coupon_id,
+            "type": coupon.type.value,
+            "label": coupon.label(),
+            "face_value": fmt_amount(coupon.face_value),
+            "threshold": fmt_amount(coupon.threshold),
+            "scope": coupon.scope_note,
+            "shop_name": coupon.shop_name or "",
+            "valid_until": coupon.valid_until.isoformat() if coupon.valid_until else "",
+            "source": coupon.source,  # api=平台公开券（可去 App 领）／screenshot=你补录的
+            "applied": coupon.coupon_id in applied_ids,
+            "reject_reason": rejected_reasons.get(coupon.coupon_id, ""),
+        }
+        for coupon in offer.coupons
+    ]
+
+
 def offer_payload(offer: Offer, breakdown: PriceBreakdown, *, group_count: int = 1, history=None) -> dict:
     """单个报价 → 前端可消费的 dict（`/api/search` 与 `/api/similar` 共用）。"""
     return {
         "platform": PLATFORM_LABELS[offer.platform],
         "title": offer.title,
         "shop": offer.shop_name or "",
+        "shop_id": offer.shop_id or "",
+        "category_ids": list(offer.category_ids),
+        "coupons": _coupon_payloads(offer, breakdown),
         "url": offer.url or "",
         "image_url": offer.image_url or "",
         "shop_kind": offer.shop_kind.value if offer.shop_kind else "",
@@ -195,62 +230,18 @@ def to_payload(result: PipelineResult) -> dict:
 
 
 def execute_search(query: str, jd_channel: int, use_llm: bool, use_risk: bool = False) -> dict:
-    """执行一次查询（LLM 理解 → 管线 → LLM 总结/风险聚类 → 序列化）。测试可直接打桩此函数。"""
-    llm_client: DeepSeekClient | None = None
-    if use_llm:
-        try:
-            llm_client = DeepSeekClient.from_env()
-        except LlmError:
-            llm_client = None
+    """执行一次查询（业务编排在 `agent.actions`，这里只做 HTTP 层的序列化）。
 
-    keyword, _ = extract_keyword(query, llm_client)
-    result = run(
-        keyword,
-        jd_enabled=jd_channel >= 0,
-        jd_elite_id=jd_channel if jd_channel > 0 else None,
-        with_risk=use_risk,
-    )
-    merged = apply_user_coupons(result)
-    if merged:
-        result.notes.append(f"已并入 {merged} 张用户补录券（明细含 [补录] 标记）")
-    result.summary, _ = compose_summary(result, llm_client)
-    if result.risk is not None:
-        result.risk = cluster_issues(result.risk, llm_client)
+    测试可直接打桩此函数（签名与返回值契约保持不变）。
+    """
+    result = compare_prices(query, jd_channel=jd_channel, use_risk=use_risk, use_llm=use_llm)
     return to_payload(result)
 
 
-def merge_user_coupons(breakdowns: list[tuple[Offer, PriceBreakdown]]) -> tuple[int, list[tuple[Offer, PriceBreakdown]]]:
-    """在**已算好**的 breakdown 上并入用户补录券（无用户库/无券时原样返回、不重算）。
-
-    刻意不重算：管线算价可能带 as_of 等参数，重算未必等价。
-    """
-    from priceradar.engine.pricing import compute_price
-    from priceradar.user_store import DEFAULT_DB, connect_user_db, load_active_coupons
-
-    if not Path(DEFAULT_DB).exists():
-        return 0, breakdowns
-    connection = connect_user_db()
-    try:
-        merged = 0
-        updated: list[tuple[Offer, PriceBreakdown]] = []
-        for offer, breakdown in breakdowns:
-            user_coupons = load_active_coupons(connection, offer.platform.value)
-            if not user_coupons:
-                updated.append((offer, breakdown))
-                continue
-            merged_offer = offer.model_copy(update={"coupons": list(offer.coupons) + user_coupons})
-            updated.append((merged_offer, compute_price(merged_offer)))
-            merged += len(user_coupons)
-        return merged, updated
-    finally:
-        connection.close()
-
-
-def apply_user_coupons(result: PipelineResult) -> int:
-    """把已确认的用户补录券并入到手价重算。返回并入张数。"""
-    merged, breakdowns = merge_user_coupons(result.breakdowns)
-    result.breakdowns = breakdowns
-    return merged
+# 用户补录券并入的实现已下沉到 `agent.actions`（MCP 侧也要用，放服务层会造成反向依赖）。
+# 这里保留同名再导出，既有的调用点与测试打桩不受影响。
+merge_user_coupons = actions.merge_user_coupons
+apply_user_coupons = actions.apply_user_coupons
 
 
 def execute_similar(goods_sign: str, limit: int = 20) -> dict:
@@ -258,28 +249,323 @@ def execute_similar(goods_sign: str, limit: int = 20) -> dict:
 
     与关键词搜索的区别：关键词搜"保温杯"会返回一堆款式各异的商品；以某个商品为锚点
     则由**平台自己**给出相似商品——这才对应"看到一件东西，想找一样的但更便宜的"。
+
+    编排在 `agent.actions.find_similar`；这里只做序列化。
     """
-    from priceradar.engine.pricing import compute_price
-    from priceradar.sources.pdd import PddClient
-
-    offers = PddClient.from_env().recommend_similar(goods_sign, limit=limit)
-    if not offers:
-        raise ValueError("未找到相似商品（该商品可能已下架，或平台无相似推荐）")
-
-    merged, breakdowns = merge_user_coupons([(offer, compute_price(offer)) for offer in offers])
-    notes = [
-        "相似商品由平台推荐（pdd.ddk.goods.recommend.get, channel_type=3）返回，"
-        "**混合有无关商品**——实测精度随品类差异大（保温杯 100% / 降噪耳机 ~47% / 连衣裙 ~33%），"
-        "请自行核对。",
-    ]
-    if merged:
-        notes.append(f"已并入 {merged} 张用户补录券（明细含 [补录] 标记）")
+    result = actions.find_similar(goods_sign, limit=limit)
     return {
-        "anchor_sign": goods_sign,
-        "count": len(breakdowns),
-        "offers": [offer_payload(offer, breakdown, group_count=1) for offer, breakdown in breakdowns],
-        "notes": notes,
+        "anchor_sign": result.anchor_sign,
+        "count": len(result.breakdowns),
+        "offers": [offer_payload(offer, breakdown, group_count=1) for offer, breakdown in result.breakdowns],
+        "notes": result.notes,
     }
+
+
+# 本层独占的事件名（上游误发同名事件会被丢弃，见 `execute_agent`）
+_TRANSPORT_EVENTS = frozenset({"final", "error"})
+
+
+def _sse(event: dict, *, event_id: int | None = None) -> str:
+    """一个 SSE 帧。`id:` 用于断线重连时的 Last-Event-ID 回放。"""
+    lines = []
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"event: {event['type']}")
+    lines.append(f"data: {json.dumps(event, ensure_ascii=False)}")
+    return "\n".join(lines) + "\n\n"
+
+
+KEEP_TURNS = 3              # 上下文里保留的最近完整轮数
+CONTEXT_CHAR_BUDGET = 16000  # 组装历史时的预算（给本轮工具结果留出余量）
+
+
+def _prepare_session(query: str, session_id: str | None) -> tuple[str, int, list[dict], str]:
+    """准备会话：取槽位与历史 → 组装本轮消息 → 落一条 user 消息。
+
+    返回 `(session_id, turn_id, messages, trim_note)`。全部是本地 sqlite 操作，毫秒级。
+    """
+    from priceradar.agent.context import SessionState, build_messages
+    from priceradar.agent.loop import SYSTEM_PROMPT
+    from priceradar.agent.session_store import (
+        append_message,
+        connect_session_db,
+        load_state,
+        load_turns,
+        new_session,
+        next_turn_id,
+        session_exists,
+    )
+
+    connection = connect_session_db()
+    try:
+        sid = session_id or new_session(connection)
+        if not session_exists(connection, sid):
+            new_session(connection, sid)
+        state = SessionState.from_dict(load_state(connection, sid))
+        turns = load_turns(connection, sid, keep_turns=KEEP_TURNS)
+        messages, trim_note = build_messages(
+            SYSTEM_PROMPT, state, turns, query, char_budget=CONTEXT_CHAR_BUDGET
+        )
+        turn_id = next_turn_id(connection, sid)
+        append_message(connection, sid, role="user", turn_id=turn_id, content=query)
+        return sid, turn_id, messages, trim_note
+    finally:
+        connection.close()
+
+
+# Agent trace 落盘位置（None = 仓库内 data/traces/agent.jsonl，gitignored）。
+# 留成模块常量是为了让测试能注入临时路径——调用时才解析，不在导入时绑定。
+AGENT_TRACE_PATH: Path | None = None
+
+
+def _persist_trace(trace: Trace, path: Path | None = None) -> None:
+    """把本轮 Agent 的 trace 追加落盘。
+
+    此前 Agent 路径**根本没建 trace**——算出来的 token 计量全丢了。
+    落盘失败不影响结果（埋点不该拖垮主流程）。
+    """
+    from priceradar.config import project_root
+
+    target = path or AGENT_TRACE_PATH or (project_root() / "data" / "traces" / "agent.jsonl")
+    try:
+        trace.append_jsonl(target)
+    except OSError:
+        pass
+
+
+def _persist_turn(session_id: str, turn_id: int, run, initial_messages: list[dict]) -> None:
+    """把本轮新产生的 assistant / tool 消息与更新后的槽位落库。
+
+    落库失败不能影响已经拿到的结果——由调用方转成提示事件。
+    """
+    from priceradar.agent.context import SessionState, update_state
+    from priceradar.agent.session_store import (
+        append_message,
+        connect_session_db,
+        load_state,
+        prune,
+        save_state,
+    )
+
+    produced = list(run.messages[len(initial_messages):]) if len(run.messages) > len(initial_messages) else []
+    if not produced and run.final_text:
+        # 降级路径可能一条助手消息都没产生（例如 LLM 不可用）——补一条，
+        # 否则下一轮会读到「只有用户发言」的半截历史
+        produced = [{"role": "assistant", "content": run.final_text}]
+
+    connection = connect_session_db()
+    try:
+        for message in produced:
+            append_message(
+                connection,
+                session_id,
+                role=message["role"],
+                turn_id=turn_id,
+                content=message.get("content"),
+                tool_calls=message.get("tool_calls"),
+                tool_call_id=message.get("tool_call_id"),
+            )
+        state = update_state(SessionState.from_dict(load_state(connection, session_id)), run)
+        save_state(connection, session_id, state.to_dict())
+        prune(connection, session_id)
+    finally:
+        connection.close()
+
+
+def execute_agent(
+    query: str,
+    jd_channel: int = 0,
+    use_llm: bool = True,
+    use_risk: bool = False,
+    *,
+    session_id: str | None = None,
+    heartbeat: float = 15.0,
+) -> Iterator[str]:
+    """Agent 循环 → SSE 帧的**同步生成器**。
+
+    为什么用同步生成器：内部全是阻塞的 urllib 调用。Starlette 的
+    `StreamingResponse` 对非 async 迭代器会走 `iterate_in_threadpool`（不阻塞事件
+    循环），而 async 生成器里做阻塞调用会卡死整个进程。
+
+    为什么把 Agent 放进**后台线程 + 队列**：`on_event` 是在循环内部同步调用的，
+    没法从回调里 yield。用队列把两侧解耦，事件才能真正**边跑边发**——
+    用户在工具还在执行时就能看到进度，而不是等全部跑完一次性涌出来。
+
+    断连处理（诚实版）：Starlette 的 `iterate_in_threadpool` **不会** close 底层
+    迭代器（已读源码确认），所以生成器的 `finally` 不会被及时执行，取消逻辑不能
+    建在它上面。这里的取舍是：断连后这次运行照常跑完（会话/结果不丢），
+    代价是一次白跑。真要取消得靠 on_event 里检查连接状态，暂不做。
+    """
+    if not use_llm:
+        yield _sse({"type": "degraded", "reason": "已关闭 LLM，走确定性比价"}, event_id=0)
+        yield _sse(_final_event(query, jd_channel, use_risk, llm_client=None), event_id=1)
+        return
+
+    sid, turn_id, messages, trim_note = _prepare_session(query, session_id)
+
+    events: Queue[dict] = Queue()
+    prelude: list[dict] = [{"type": "session", "session_id": sid}]
+    if trim_note:
+        prelude.append({"type": "notice", "message": trim_note})
+
+    def worker() -> None:
+        trace = Trace()
+        try:
+            run = run_agent(
+                query,
+                messages=messages,
+                on_event=events.put,
+                jd_channel=jd_channel,
+                use_risk=use_risk,
+                trace=trace,
+                # 用户在界面上设的京东频道必须**真的到工具里**：模型不会主动传
+                # `jd_channel`（它不在描述里强调），不补这一层，「关闭京东侧」
+                # 这类开关在 Agent 模式下就是摆设。
+                tool_defaults={"jd_channel": jd_channel},
+            )
+        except Exception as exc:  # 首个 chunk 之后异常处理器已失效，必须自己转成事件
+            events.put({"type": "__error", "message": f"{type(exc).__name__}: {exc}"})
+            return
+        try:
+            _persist_turn(sid, turn_id, run, messages)
+        except Exception as exc:  # 落库失败不能吞掉已经拿到的结果，如实提示
+            events.put({"type": "notice", "message": f"本轮对话未能存入会话（不影响结果）：{exc}"})
+        _persist_trace(trace)
+        events.put({"type": "__done", "run": run})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    counter = 0
+    for event in prelude:
+        counter += 1
+        yield _sse(event, event_id=counter)
+
+    while True:
+        try:
+            event = events.get(timeout=heartbeat)
+        except Empty:
+            yield ": ping\n\n"  # SSE 注释行做心跳，防代理按空闲超时切断
+            continue
+        if event["type"] == "__done":
+            run = event["run"]
+            counter += 1
+            yield _sse(_agent_result_event(run, jd_channel, use_risk, session_id=sid), event_id=counter)
+            return
+        if event["type"] == "__error":
+            counter += 1
+            yield _sse({"type": "error", "message": event["message"]}, event_id=counter)
+            return
+        if event.get("type") in _TRANSPORT_EVENTS:
+            # 本层**独占** final / error：上游（或日后新增的节点）误发同名事件一律丢弃。
+            # 起因：loop 曾自己 emit 一个 {"type":"final"}（只有 text、没有 payload），
+            # 前端收到就先 close 了，真正的 final 再也到不了，比价卡片永远出不来。
+            continue
+        counter += 1
+        yield _sse(event, event_id=counter)
+
+
+def _agent_result_event(run, jd_channel: int, use_risk: bool, *, session_id: str = "") -> dict:
+    """终帧：既有前端 payload + Agent 自己的元信息（含真实 token 计量与成本）。"""
+    payload = to_payload(run.result) if run.result is not None else None
+    trace = run.trace
+    return {
+        "type": "final",
+        "stopped_by": run.stopped_by,
+        "degraded": run.degraded,
+        "final_text": run.final_text,
+        "tools": [execution.name for step in run.steps for execution in step.tool_calls],
+        "rounds": len(run.steps),
+        "session_id": session_id,
+        "usage": {
+            "prompt_tokens": run.usage.prompt_tokens,
+            "completion_tokens": run.usage.completion_tokens,
+            "cache_hit_tokens": run.usage.cache_hit_tokens,
+            "cache_miss_tokens": run.usage.cache_miss_tokens,
+            "cache_hit_rate": round(run.usage.cache_hit_rate, 4),
+            # 成本：有 token 就是真实单价算的；没有则回退到按次粗估（如实标注）
+            "cost": str(trace.est_cost) if trace is not None else "0",
+            "cost_is_estimated": bool(trace.llm_cost_is_estimate) if trace is not None else True,
+        },
+        "payload": payload,
+    }
+
+
+def _final_event(query: str, jd_channel: int, use_risk: bool, *, llm_client) -> dict:
+    """不走 Agent 的直通终帧（`llm=false` 时）。"""
+    result = compare_prices(query, jd_channel=jd_channel, use_risk=use_risk, llm_client=llm_client)
+    return {
+        "type": "final",
+        "stopped_by": "llm_disabled",
+        "degraded": True,
+        "final_text": result.summary or "",
+        "tools": [],
+        "rounds": 0,
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "cache_hit_rate": 0.0},
+        "payload": to_payload(result),
+    }
+
+
+@app.get("/api/agent/stream")
+def api_agent_stream(
+    q: str = Query(..., min_length=1, description="自然语言或关键词"),
+    jd_channel: int = 0,
+    llm: bool = True,
+    risk: bool = False,
+    session_id: str | None = Query(None, description="会话 ID；不传则新建，追问时带上上一轮返回的那个"),
+) -> StreamingResponse:
+    """Agent 流式查询：边跑边推工具进度，最后给完整 payload。
+
+    响应头三件套（部署到 nginx 时缺 `X-Accel-Buffering: no` 流会被缓冲成一坨）。
+    """
+    return StreamingResponse(
+        execute_agent(q, jd_channel=jd_channel, use_llm=llm, use_risk=risk, session_id=session_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@app.get("/api/sessions")
+def api_list_sessions(limit: int = 20) -> dict:
+    """最近的会话（供「继续上次」用）。"""
+    from priceradar.agent.session_store import connect_session_db, list_sessions
+
+    connection = connect_session_db()
+    try:
+        return {"sessions": list_sessions(connection, limit=limit)}
+    finally:
+        connection.close()
+
+
+@app.get("/api/sessions/{session_id}")
+def api_get_session(session_id: str) -> dict:
+    """单个会话的消息与槽位（刷新页面后恢复对话用）。"""
+    from priceradar.agent.session_store import connect_session_db, load_state, load_turns, session_exists
+
+    connection = connect_session_db()
+    try:
+        if not session_exists(connection, session_id):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {
+            "session_id": session_id,
+            "state": load_state(connection, session_id),
+            "turns": load_turns(connection, session_id, keep_turns=None),
+        }
+    finally:
+        connection.close()
+
+
+@app.delete("/api/sessions/{session_id}")
+def api_delete_session(session_id: str) -> dict:
+    """删除会话（消息与槽位一并删除）。"""
+    from priceradar.agent.session_store import connect_session_db, delete_session, session_exists
+
+    connection = connect_session_db()
+    try:
+        existed = session_exists(connection, session_id)
+        delete_session(connection, session_id)
+    finally:
+        connection.close()
+    return {"deleted": existed, "session_id": session_id}
 
 
 def execute_snapshot() -> dict:
@@ -313,7 +599,7 @@ def api_search(
     try:
         return execute_search(q, jd_channel, llm, risk)
     except PddApiError as exc:
-        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{exc}") from exc
+        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{explain_pdd_error(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -324,7 +610,7 @@ def api_similar(goods_sign: str = Query(..., min_length=1), limit: int = 20) -> 
     try:
         return execute_similar(goods_sign, limit=limit)
     except PddApiError as exc:
-        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{exc}") from exc
+        raise HTTPException(status_code=502, detail=f"拼多多检索失败：{explain_pdd_error(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -373,6 +659,7 @@ def _watchlist_overview(connection, limit: int = 8) -> list[dict]:
                 "verdict": view["verdict"],
                 "series": series,
                 "fake_discount": view.get("fake_discount"),
+                "coupon_withdrawn": view.get("coupon_withdrawn"),
             }
         )
     return overview
@@ -417,6 +704,52 @@ def watchlist_status(db_path: Path | None = None) -> dict:
 def api_watchlist_status() -> dict:
     """快照按钮配套：今日采集状态 + 降价提醒清单 + 关注面板。"""
     return watchlist_status()
+
+
+class WatchRequest(BaseModel):
+    keyword: str = Field(min_length=1, max_length=80, description="要关注的检索关键词")
+
+
+@app.get("/api/watchlist")
+def api_get_watchlist() -> dict:
+    """关注清单（每日快照采集的输入）。
+
+    PRD §4.2 承诺的「帮我盯着降价」原先没有落点——只能手改
+    `data/watchlist.json`，多轮 UI 上点它就是个死胡同。这三个接口把它补上。
+    """
+    from priceradar.jobs.snapshot import load_watchlist
+
+    watchlist = load_watchlist()
+    return {"keywords": watchlist.get("keywords", []), "jd_elite_id": watchlist.get("jd_elite_id", 0)}
+
+
+@app.post("/api/watchlist")
+def api_add_watch(item: WatchRequest) -> dict:
+    """加入关注清单（幂等：已存在时不重复添加）。"""
+    from priceradar.jobs.snapshot import add_watch_keyword
+
+    try:
+        keywords, added = add_watch_keyword(item.keyword)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "keywords": keywords,
+        "added": added,
+        "note": f"已关注「{item.keyword}」，下次采集快照时一并采集" if added else f"「{item.keyword}」已在关注清单里",
+    }
+
+
+@app.delete("/api/watchlist")
+def api_remove_watch(keyword: str = Query(..., min_length=1)) -> dict:
+    """从关注清单移除（已采集的历史数据**不受影响**，只是不再继续跟踪）。"""
+    from priceradar.jobs.snapshot import remove_watch_keyword
+
+    keywords, removed = remove_watch_keyword(keyword)
+    return {
+        "keywords": keywords,
+        "removed": removed,
+        "note": f"已取消关注「{keyword}」（历史快照仍保留）" if removed else f"「{keyword}」不在关注清单里",
+    }
 
 
 def execute_vision(image_bytes: bytes, media_type: str, mode: str) -> dict:
@@ -472,6 +805,7 @@ async def api_vision(file: UploadFile = File(...), mode: str = "product") -> dic
 @app.post("/api/coupons")
 def api_confirm_coupons(extraction: CouponExtraction) -> dict:
     """用户确认后的券写入（§5.6：识别 → 用户确认 → 才入库；入库后查询自动并入重算）。"""
+    from priceradar.domain.models import CouponType
     from priceradar.user_store import connect_user_db, save_coupons
 
     coupons = to_offer_coupons(extraction)
@@ -482,11 +816,19 @@ def api_confirm_coupons(extraction: CouponExtraction) -> dict:
         stored = save_coupons(connection, extraction.platform, coupons)
     finally:
         connection.close()
-    return {
-        "stored": stored,
-        "platform": extraction.platform,
-        "note": f"已写入 {stored} 张用户券；下次查询将自动并入重算（明细含 [补录] 标记）",
-    }
+
+    # 写入成功 ≠ 会生效：店铺券/品类券必须有绑定依据才套用。这里如实说清楚，
+    # 否则用户会以为"补录了就一定算进到手价"。
+    shop_scoped = (CouponType.SHOP, CouponType.COLLECT)
+    unbound = sum(1 for c in coupons if c.type in shop_scoped and not (c.shop_id or c.shop_name))
+    unbound += sum(1 for c in coupons if c.type is CouponType.CATEGORY and not c.category_ids)
+    note = f"已写入 {stored} 张用户券；下次查询将自动并入重算（明细含 [补录] 标记）"
+    if unbound:
+        note += f"；其中 {unbound} 张未绑定适用范围，不会自动套用"
+    mismatched = [c for c in coupons if c.type is CouponType.PLATFORM and (c.shop_id or c.shop_name)]
+    if mismatched:
+        note += "；⚠️ 有券标为平台券却带了店铺信息——平台券会套用到全平台，请确认类型填对"
+    return {"stored": stored, "platform": extraction.platform, "note": note}
 
 
 @app.get("/api/coupons")
@@ -501,6 +843,32 @@ def api_list_coupons(platform: str | None = None) -> dict:
         return {"coupons": list_coupons(connection, platform)}
     finally:
         connection.close()
+
+
+@app.delete("/api/coupons")
+def api_delete_coupon(
+    platform: str = Query(..., min_length=1), coupon_id: str = Query(..., min_length=1)
+) -> dict:
+    """删除一张用户券（幂等：库里没有这张券返回 deleted=false，不 404）。
+
+    券的唯一键是 (platform, coupon_id)——表上就是这个 UNIQUE 约束。
+    """
+    from priceradar.user_store import DEFAULT_DB, connect_user_db, delete_coupon
+
+    # 不为了让 DELETE「成功」而凭空建库（同 GET 的做法）
+    if not Path(DEFAULT_DB).exists():
+        return {"deleted": False, "platform": platform, "coupon_id": coupon_id, "note": "本地还没有券记录"}
+    connection = connect_user_db()
+    try:
+        deleted = delete_coupon(connection, platform, coupon_id)
+    finally:
+        connection.close()
+    return {
+        "deleted": deleted,
+        "platform": platform,
+        "coupon_id": coupon_id,
+        "note": "已删除该券（重新查询后不再套用）" if deleted else "没有找到这张券（可能已被删除）",
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -5,6 +5,11 @@
 - scan_risk           ：商品名 → 全网风险扫描（博查检索 + LLM 聚类 + 覆盖声明）
 - check_price_history ：关键词 → 自采快照的价格观测（观测天数/分位/先涨后降/大促日历）
 
+**本模块只做协议适配与文本渲染**——编排在 `agent.actions`，与 Web `/api/search`、
+Agent 循环共用同一份实现。此前三处各写一遍，语义已经分叉（MCP 侧漏了用户补录券）。
+工具的**签名保持平铺**（`query` / `product` / `keyword`）：它由 mcp SDK 从函数签名
+推导 inputSchema，是已经在 Claude/Cursor 里配置好的对外契约，改成收对象即破坏兼容。
+
 运行（stdio 传输，基于 mcp SDK 2.x 的 MCPServer）：
     python -m priceradar.mcp_server
 
@@ -26,11 +31,17 @@ from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
-from priceradar.agent.llm import DeepSeekClient, LlmError
-from priceradar.agent.llm_nodes import compose_summary, extract_keyword
-from priceradar.agent.pipeline import render, run
-from priceradar.insights import campaign_context, sku_history_view
-from priceradar.risk import COVERAGE_NOTE, cluster_issues, scan_with_env
+# ⚠️ 必须用别名导入：本模块的 MCP 工具函数恰好与 action **同名**
+# （compare_prices / scan_risk / check_price_history），直接用原名会被后面的
+# def 遮蔽——`_compare_text` 里调到的就成了 MCP 工具包装函数本身，静默拿到 str。
+from priceradar.agent.actions import (
+    check_price_history as action_check_price_history,
+    compare_prices as action_compare_prices,
+    scan_risk as action_scan_risk,
+    summarize_history,
+)
+from priceradar.agent.pipeline import render
+from priceradar.risk import COVERAGE_NOTE
 from priceradar.sources.bocha import BochaError
 from priceradar.sources.pdd import PddApiError
 
@@ -44,34 +55,28 @@ mcp = MCPServer(
 )
 
 
-def _llm_client() -> DeepSeekClient | None:
-    try:
-        return DeepSeekClient.from_env()
-    except LlmError:
-        return None
-
-
 def _compare_text(query: str, jd_channel: int = 0) -> str:
-    """全管线：查询理解 → 检索 → 匹配 → 到手价 → 对比卡（纯文本输出）。"""
-    llm_client = _llm_client()
-    keyword, _ = extract_keyword(query, llm_client)
+    """全管线：查询理解 → 检索 → 匹配 → 到手价 → 用户券并入 → 对比卡（纯文本输出）。
+
+    编排在 `agent.actions.compare_prices`（与 Web `/api/search`、Agent 循环**同一份实现**）。
+    此前这里自己拼了一遍，且漏掉了用户补录券与风险聚类——同一个「比价」在两处给出不同
+    结果，是个既存不一致，现已消除。
+    """
     try:
-        result = run(keyword, jd_enabled=jd_channel >= 0, jd_elite_id=jd_channel if jd_channel > 0 else None)
+        result = action_compare_prices(query, jd_channel=jd_channel)
     except PddApiError as exc:
         return f"拼多多检索失败：{exc}"
-    except ValueError as exc:
+    except ValueError as exc:  # 类目空洞 / 无检索结果：如实转达
         return str(exc)
-    result.summary, _ = compose_summary(result, llm_client)
     return render(result)
 
 
 def _risk_text(product: str) -> str:
     """L2 风险扫描文本输出（有证据列主题，无证据如实说明，固定附覆盖声明）。"""
     try:
-        summary = scan_with_env(product)
+        summary = action_scan_risk(product)
     except BochaError as exc:
         return f"风险扫描失败：{exc}"
-    summary = cluster_issues(summary, _llm_client())
 
     lines = [f"风险扫描：{summary.product}（{len(summary.queries)} 组关键词 · 命中 {len(summary.items)} 条讨论）"]
     if summary.issues:
@@ -87,41 +92,12 @@ def _risk_text(product: str) -> str:
 
 
 def _price_history_text(keyword: str, db_path: Path | None = None) -> str:
-    """快照库价格观测文本输出（样本不足时诚实降级）。"""
-    from priceradar.jobs.snapshot import DEFAULT_DB, connect
+    """快照库价格观测文本输出（样本不足时诚实降级）。
 
-    path = db_path or DEFAULT_DB
-    if not Path(path).exists():
-        return "暂无快照数据：请先在 Web 界面点「采集今日快照」或运行 python -m priceradar.jobs.snapshot"
-
-    connection = connect(path)
-    try:
-        rows = connection.execute(
-            """
-            SELECT platform, sku_id, MAX(title) AS title, COUNT(DISTINCT captured_date) AS days
-            FROM price_snapshots WHERE keyword LIKE ? GROUP BY platform, sku_id
-            ORDER BY days DESC, sku_id LIMIT 5
-            """,
-            (f"%{keyword}%",),
-        ).fetchall()
-        if not rows:
-            return f"快照库中没有与「{keyword}」相关的商品（关注清单见 data/watchlist.json）"
-
-        lines = [f"价格观测：与「{keyword}」相关的商品（基于自采快照，非平台全历史）"]
-        context = campaign_context()
-        if context:
-            lines.append(f"大促日历（参考往年规律）：{context}")
-        for platform, sku_id, title, _days in rows:
-            view = sku_history_view(connection, platform, sku_id)
-            lines.append(f"- [{platform}] {title[:36]}：已观测 {view['observed_days']} 天 ｜ {view['verdict']}")
-            if view.get("lowest"):
-                lines.append(f"  观测最低：￥{view['lowest']}")
-            if view.get("fake_discount"):
-                lines.append(f"  △ {view['fake_discount']}")
-        lines.append("※ 样本不足时不出时机结论（诚实降级）")
-        return "\n".join(lines)
-    finally:
-        connection.close()
+    渲染直接复用 `actions.summarize_history`——它本来就是同一个格式，
+    再手写一遍就是第四份重复了。
+    """
+    return summarize_history(action_check_price_history(keyword, db_path=db_path))
 
 
 @mcp.tool()
