@@ -511,7 +511,7 @@ def test_run_action_unknown_tool_is_not_retryable():
     assert outcome.retryable is False
 
 
-def test_run_action_rejects_undeclared_arguments(monkeypatch):
+def test_run_action_rejects_undeclared_arguments(monkeypatch, tmp_path):
     """模型自造的参数名必须被拒——不能让它绕过 schema 去改工具行为。
 
     起因：`use_risk` 被**刻意**从 `compare_prices` 的 schema 里移除了（它与独立的
@@ -527,8 +527,27 @@ def test_run_action_rejects_undeclared_arguments(monkeypatch):
     assert outcome.retryable is False
     assert "schema" in outcome.hint
 
-    db_outcome = actions.run_action("check_price_history", {"keyword": "x", "db_path": "/etc/passwd"})
+    db_outcome = actions.run_action(
+        "check_price_history", {"keyword": "x", "db_path": str(tmp_path / "nothing.db")}
+    )
     assert db_outcome.ok is True          # db_path 在白名单里（测试与命令行要用）
+
+
+def test_internal_db_path_works_as_str_on_existing_file(tmp_path):
+    """内部参数 `db_path` 从 JSON / CLI 进来是 **字符串**，且路径**存在**时也必须能用。
+
+    Linux CI 首次真跑时抓到的 bug：`connect()` 对参数直接调 `.parent`（只对 `Path`
+    成立），str 一进去就 AttributeError。原来的用例传 `/etc/passwd`——Linux 上它
+    真的存在（于是炸），Windows 上它不存在（走「暂无快照数据」早退分支，假绿至今）。
+    这里刻意用 string 指向**真实存在**的快照库，两个平台都测得到。
+    """
+    from priceradar.jobs.snapshot import connect
+
+    connect(tmp_path / "history.db").close()
+    outcome = actions.run_action(
+        "check_price_history", {"keyword": "x", "db_path": str(tmp_path / "history.db")}
+    )
+    assert outcome.ok is True
 
 
 def test_run_action_invalid_arguments_are_reported_not_raised():

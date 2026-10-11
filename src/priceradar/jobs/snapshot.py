@@ -62,7 +62,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_snap_unique ON price_snapshots(platform, s
 """
 
 
-def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
+def connect(db_path: Path | str = DEFAULT_DB) -> sqlite3.Connection:
+    # 归一化：内部参数 / CLI 进来的 db_path 是 str，而 `.parent` 只对 Path 成立。
+    # 曾让「字符串路径 + 文件真实存在」的组合在 Linux CI 上炸（见 test_actions 回归用例）。
+    db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path)
     connection.executescript(SCHEMA)
