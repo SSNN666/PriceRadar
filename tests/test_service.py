@@ -268,8 +268,15 @@ def test_offers_payload_exposes_goods_sign():
     assert "goods_sign" in payload["offers"][0]
 
 
-def test_merge_user_coupons_does_not_recompute_without_db():
-    """无用户库时必须原样返回（不重算）——管线算价可能带 as_of 等参数，重算未必等价。"""
+def test_merge_user_coupons_does_not_recompute_without_db(tmp_path, monkeypatch):
+    """无用户库时必须原样返回（不重算）——管线算价可能带 as_of 等参数，重算未必等价。
+
+    必须显式打桩 DEFAULT_DB：不打桩时读的是本机 `data/user_data.db`，
+    本机一旦有补录券（手动测试留下的），「无库」前提就不成立。
+    """
+    import priceradar.user_store as user_store
+
+    monkeypatch.setattr(user_store, "DEFAULT_DB", tmp_path / "none.db")
     offer = Offer(platform=Platform.PDD, sku_id="x", title="t", list_price=Decimal("10"))
     original = compute_price(offer)
     merged, breakdowns = api_module.merge_user_coupons([(offer, original)])
